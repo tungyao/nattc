@@ -51,6 +51,7 @@ int client_init(struct client_context *ctx, const char *server_ip, uint16_t serv
     ctx->arp_table = NULL;
     ctx->peers = NULL;
     ctx->last_heartbeat = 0;
+    ctx->last_server_rx = 0;
     ctx->punch_failures = 0;
     memset(&ctx->server_observed_addr, 0, sizeof(ctx->server_observed_addr));
 
@@ -665,6 +666,7 @@ void client_run(struct client_context *ctx) {
     printf("Client running...\n");
 
     xpoll_t *xp = xpoll_create(2);
+    ctx->xp = xp;
     {
         struct xpoll_event ev;
         memset(&ev, 0, sizeof(ev));
@@ -689,7 +691,7 @@ void client_run(struct client_context *ctx) {
 #ifndef _WIN32
         {
             struct xpoll_event events[2];
-            int n = xpoll_wait(xp, events, 2, 1);
+            int n = xpoll_wait(xp, events, 2, 10);
             if (n < 0) {
                 if (sock_errno() == EINTR) continue;
                 fprintf(stderr, "xpoll_wait failed: %s\n", sock_strerror());
@@ -705,7 +707,7 @@ void client_run(struct client_context *ctx) {
 #else
         {
             struct xpoll_event events[1];
-            int n = xpoll_wait(xp, events, 1, 50);
+            int n = xpoll_wait(xp, events, 1, 10);
             if (n < 0) {
                 int se = sock_errno();
                 if (se == WSAEINTR) continue;
@@ -787,12 +789,23 @@ void client_run(struct client_context *ctx) {
 
         /* Periodic tasks */
         time_t now = time(NULL);
-        if (!ctx->login_received && (now - ctx->login_sent_time) > LOGIN_TIMEOUT_SEC) {
+        if (!ctx->login_received && ctx->last_server_rx == 0 &&
+            (now - ctx->login_sent_time) > LOGIN_TIMEOUT_SEC) {
             fprintf(stderr, "ERROR: Cannot reach server (no response after %d seconds).\n"
                     "       Check server IP/port, firewall rules, and that the server is running.\n",
                     LOGIN_TIMEOUT_SEC);
             running = 0;
             break;
+        }
+        /* Detect server restart: if we were logged in but server went silent,
+           automatically re-login to re-establish the session. */
+        if (ctx->login_received && ctx->last_server_rx > 0 &&
+            (now - ctx->last_server_rx) > SERVER_TIMEOUT_SEC) {
+            printf("Server unreachable for %d seconds, re-logging in...\n",
+                   SERVER_TIMEOUT_SEC);
+            ctx->login_received = 0;
+            ctx->last_server_rx = now;
+            client_resend_login(ctx);
         }
         if (now - last_timeout_check >= 1) {
             if (now - ctx->last_heartbeat >= HEARTBEAT_INTERVAL_SEC) {
@@ -872,6 +885,7 @@ void client_run(struct client_context *ctx) {
         }
     }
     xpoll_close(xp);
+    ctx->xp = NULL;
 }
 
 void client_cleanup(struct client_context *ctx) {
@@ -911,6 +925,13 @@ void client_handle_message(struct client_context *ctx, const struct sockaddr_in 
     if (magic != PROTO_MAGIC) { fprintf(stderr, "Invalid magic: 0x%04X\n", magic); return; }
     if (len < sizeof(struct msg_header) + body_len) { fprintf(stderr, "Message truncated\n"); return; }
     const void *body = (const char*)msg + sizeof(struct msg_header);
+
+    /* Track last server contact time for re-login on server restart */
+    if (src_addr->sin_addr.s_addr == ctx->server_addr.sin_addr.s_addr &&
+        src_addr->sin_port == ctx->server_addr.sin_port) {
+        ctx->last_server_rx = time(NULL);
+    }
+
     switch (type) {
         case MSG_LOGIN_RESP:      client_handle_login_resp(ctx, (const struct login_resp*)body, body_len, type); break;
         case MSG_LOGIN_RESP_V2:   client_handle_login_resp_v2(ctx, (const struct login_resp_v2*)body, body_len); break;
@@ -1456,6 +1477,11 @@ void client_send_arp_reply(struct client_context *ctx, const uint8_t *pkt, uint3
 
 int client_rebind_udp(struct client_context *ctx) {
     printf("Rebinding UDP socket (old fd=%d)...\n", ctx->udp_fd);
+
+    /* Remove old fd from epoll/IOCP before closing */
+    if (ctx->xp) {
+        xpoll_ctl(ctx->xp, XPOLL_CTL_DEL, ctx->udp_fd, NULL);
+    }
     sock_close(ctx->udp_fd);
 
     ctx->udp_fd = create_udp_socket();
@@ -1469,6 +1495,16 @@ int client_rebind_udp(struct client_context *ctx) {
         ctx->udp_fd = -1;
         return -1;
     }
+
+    /* Register new fd with epoll/IOCP */
+    if (ctx->xp) {
+        struct xpoll_event ev;
+        memset(&ev, 0, sizeof(ev));
+        ev.events = XPOLLIN;
+        ev.data.fd = ctx->udp_fd;
+        xpoll_ctl(ctx->xp, XPOLL_CTL_ADD, ctx->udp_fd, &ev);
+    }
+
     printf("New UDP socket created (fd=%d)\n", ctx->udp_fd);
     return 0;
 }

@@ -2,6 +2,7 @@
 #define CLIENT_H
 
 #include "common.h"
+#include "xpoll.h"
 
 #define MAX_EVENTS 64
 #define PUNCH_ATTEMPTS_FIRST 5
@@ -15,6 +16,7 @@
 #define PEER_KEEPALIVE_INTERVAL 5
 #define HEARTBEAT_INTERVAL_SEC 10
 #define LOGIN_TIMEOUT_SEC 5
+#define SERVER_TIMEOUT_SEC 30
 #define PUNCH_REBIND_THRESHOLD 2
 #define TUN_MTU 1400
 
@@ -70,6 +72,7 @@ struct client_context {
     time_t last_heartbeat;
     time_t login_sent_time;
     int login_received;
+    time_t last_server_rx;
     int punch_failures;
 
     /* Dynamic UDP buffer */
@@ -89,6 +92,8 @@ struct client_context {
     int send_ring_head;
     int send_ring_tail;
     int send_ring_count;
+
+    xpoll_t *xp;  /* epoll/IOCP handle, used by rebind to re-register */
 
 #ifdef _WIN32
     struct wintun_ctx wintun;

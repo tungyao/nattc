@@ -1,11 +1,11 @@
 cmake_minimum_required(VERSION 3.10)
 project(p2p_punch C)
 
-set(CMAKE_C_STANDARD 99)
+set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 
 # Common sources
-set(COMMON_SOURCES utils.c xpoll.c)
+set(COMMON_SOURCES utils.c xpoll.c iocp.c)
 
 # Server
 add_executable(p2p_server
@@ -26,6 +26,8 @@ target_link_libraries(p2p_client PRIVATE)
 if(UNIX AND NOT APPLE)
     target_link_libraries(p2p_server PRIVATE rt)
     target_link_libraries(p2p_client PRIVATE rt)
+    target_compile_definitions(p2p_server PRIVATE _GNU_SOURCE)
+    target_compile_definitions(p2p_client PRIVATE _GNU_SOURCE)
 endif()
 
 if(WIN32)

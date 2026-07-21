@@ -4,7 +4,6 @@
 
 #ifdef _WIN32
 
-#define IOCP_IMPL
 #include "iocp.h"
 
 struct xpoll_s {
@@ -21,12 +20,12 @@ xpoll_t* xpoll_create(int size) {
 
 int xpoll_ctl(xpoll_t *xp, int op, int fd, struct xpoll_event *ev) {
     if (!xp) { WSASetLastError(WSAEINVAL); return -1; }
-    return iocp_ctl(xp->iocp, op, (SOCKET)fd, (struct iocp_event*)ev);
+    return iocp_ctl(xp->iocp, op, (SOCKET)fd, (struct iocp_event*)(void*)ev);
 }
 
 int xpoll_wait(xpoll_t *xp, struct xpoll_event *events, int maxevents, int timeout_ms) {
     if (!xp) { WSASetLastError(WSAEINVAL); return -1; }
-    return iocp_wait(xp->iocp, (struct iocp_event*)events, maxevents, timeout_ms);
+    return iocp_wait(xp->iocp, (struct iocp_event*)(void*)events, maxevents, timeout_ms);
 }
 
 int xpoll_close(xpoll_t *xp) {
@@ -42,26 +41,39 @@ int xpoll_close(xpoll_t *xp) {
 #include <unistd.h>
 #include <errno.h>
 
+#define XPOLL_MAX_EVENTS 64
+
 struct xpoll_s {
     int epfd;
 };
 
 xpoll_t* xpoll_create(int size) {
+    (void)size;
     xpoll_t *xp = (xpoll_t*)malloc(sizeof(xpoll_t));
     if (!xp) { errno = ENOMEM; return NULL; }
-    xp->epfd = epoll_create(size);
+    xp->epfd = epoll_create1(EPOLL_CLOEXEC);
     if (xp->epfd < 0) { free(xp); return NULL; }
     return xp;
 }
 
 int xpoll_ctl(xpoll_t *xp, int op, int fd, struct xpoll_event *ev) {
     if (!xp) { errno = EINVAL; return -1; }
-    return epoll_ctl(xp->epfd, op, fd, (struct epoll_event*)ev);
+    struct epoll_event eev;
+    eev.events = ev->events;
+    eev.data.fd = ev->data.fd;
+    return epoll_ctl(xp->epfd, op, fd, &eev);
 }
 
 int xpoll_wait(xpoll_t *xp, struct xpoll_event *events, int maxevents, int timeout_ms) {
     if (!xp) { errno = EINVAL; return -1; }
-    return epoll_wait(xp->epfd, (struct epoll_event*)events, maxevents, timeout_ms);
+    struct epoll_event eev[XPOLL_MAX_EVENTS];
+    if (maxevents > XPOLL_MAX_EVENTS) maxevents = XPOLL_MAX_EVENTS;
+    int n = epoll_wait(xp->epfd, eev, maxevents, timeout_ms);
+    for (int i = 0; i < n; i++) {
+        events[i].events = eev[i].events;
+        events[i].data.fd = eev[i].data.fd;
+    }
+    return n;
 }
 
 int xpoll_close(xpoll_t *xp) {

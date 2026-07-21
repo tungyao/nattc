@@ -22,7 +22,7 @@ extern "C" {
 #define XPOLL_CTL_MOD 2
 #define XPOLL_CTL_DEL 3
 
-typedef struct xpoll_event {
+typedef struct __attribute__((__packed__)) xpoll_event {
     uint32_t   events;
     union {
         void     *ptr;
