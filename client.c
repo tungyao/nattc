@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include "xpoll.h"
 
 #ifndef _WIN32
 #include <unistd.h>
@@ -663,35 +664,60 @@ void client_run(struct client_context *ctx) {
 
     printf("Client running...\n");
 
-    while (running) {
-        struct timeval tv;
-        fd_set readfds;
-        int max_fd = ctx->udp_fd;
+    xpoll_t *xp = xpoll_create(2);
+    {
+        struct xpoll_event ev;
+        memset(&ev, 0, sizeof(ev));
+        ev.events = XPOLLIN;
+        ev.data.fd = ctx->udp_fd;
+        xpoll_ctl(xp, XPOLL_CTL_ADD, ctx->udp_fd, &ev);
+    }
+#ifndef _WIN32
+    {
+        struct xpoll_event ev;
+        memset(&ev, 0, sizeof(ev));
+        ev.events = XPOLLIN;
+        ev.data.fd = ctx->tun_fd;
+        xpoll_ctl(xp, XPOLL_CTL_ADD, ctx->tun_fd, &ev);
+    }
+#endif
 
-        FD_ZERO(&readfds);
-        FD_SET(ctx->udp_fd, &readfds);
+    while (running) {
+        int udp_ready = 0;
+        int tun_ready = 0;
 
 #ifndef _WIN32
-        FD_SET(ctx->tun_fd, &readfds);
-        if (ctx->tun_fd > max_fd) max_fd = ctx->tun_fd;
-        tv.tv_sec = 0; tv.tv_usec = 1000;
-#else
-        tv.tv_sec = 0; tv.tv_usec = 50000;
-#endif
-
-        int nfds = select(max_fd + 1, &readfds, NULL, NULL, &tv);
-        if (nfds < 0) {
-            if (sock_errno() == EINTR
-#ifdef _WIN32
-                || sock_errno() == WSAEINTR
-#endif
-               ) continue;
-            fprintf(stderr, "select failed: %s\n", sock_strerror());
-            break;
+        {
+            struct xpoll_event events[2];
+            int n = xpoll_wait(xp, events, 2, 1);
+            if (n < 0) {
+                if (sock_errno() == EINTR) continue;
+                fprintf(stderr, "xpoll_wait failed: %s\n", sock_strerror());
+                break;
+            }
+            for (int i = 0; i < n; i++) {
+                if (events[i].data.fd == ctx->udp_fd && (events[i].events & XPOLLIN))
+                    udp_ready = 1;
+                if (events[i].data.fd == ctx->tun_fd && (events[i].events & XPOLLIN))
+                    tun_ready = 1;
+            }
         }
+#else
+        {
+            struct xpoll_event events[1];
+            int n = xpoll_wait(xp, events, 1, 50);
+            if (n < 0) {
+                int se = sock_errno();
+                if (se == WSAEINTR) continue;
+                fprintf(stderr, "xpoll_wait failed: %s\n", sock_strerror());
+                break;
+            }
+            udp_ready = (n > 0 && (events[0].events & XPOLLIN));
+        }
+#endif
 
         /* Handle UDP data */
-        if (FD_ISSET(ctx->udp_fd, &readfds)) {
+        if (udp_ready) {
             for (;;) {
                 char buf[MAX_MSG_SIZE];
                 struct sockaddr_in src_addr;
@@ -721,7 +747,7 @@ void client_run(struct client_context *ctx) {
 
         /* Handle TUN data */
 #ifndef _WIN32
-        if (FD_ISSET(ctx->tun_fd, &readfds)) {
+        if (tun_ready) {
             for (;;) {
                 char buf[MAX_MSG_SIZE];
                 int n = tun_read(ctx, buf, sizeof(buf));
@@ -738,16 +764,14 @@ void client_run(struct client_context *ctx) {
             if (ctx->wintun.read_event) {
                 DWORD wr = WaitForSingleObject(ctx->wintun.read_event, 0);
                 if (wr == WAIT_OBJECT_0) {
-                    /* event signaled, read below */
                 } else if (wr == WAIT_TIMEOUT) {
-                    should_read = 0; /* no data ready */
+                    should_read = 0;
                 } else {
                     static int once = 0;
                     if (!once) { fprintf(stderr, "WaitForSingleObject FAILED: %lu\n", GetLastError()); once = 1; }
                     should_read = 0;
                 }
             }
-            /* If read_event is NULL or signaled, try non-blocking read */
             if (should_read) {
                 for (;;) {
                     char buf[MAX_MSG_SIZE];
@@ -847,6 +871,7 @@ void client_run(struct client_context *ctx) {
             last_timeout_check = now;
         }
     }
+    xpoll_close(xp);
 }
 
 void client_cleanup(struct client_context *ctx) {

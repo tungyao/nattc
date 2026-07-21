@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include "xpoll.h"
 #ifndef _WIN32
 #include <unistd.h>
 #include <errno.h>
@@ -45,26 +46,31 @@ void server_run(struct server_context *ctx) {
     time_t last_timeout_check = time(NULL);
     printf("Server running...\n");
 
-    while (running) {
-        struct timeval tv;
-        fd_set readfds;
-        FD_ZERO(&readfds);
-        FD_SET(ctx->udp_fd, &readfds);
-        tv.tv_sec = 1;
-        tv.tv_usec = 0;
+    xpoll_t *xp = xpoll_create(1);
+    struct xpoll_event ev;
+    memset(&ev, 0, sizeof(ev));
+    ev.events = XPOLLIN;
+    ev.data.fd = ctx->udp_fd;
+    if (xpoll_ctl(xp, XPOLL_CTL_ADD, ctx->udp_fd, &ev) < 0) {
+        fprintf(stderr, "xpoll_ctl failed: %s\n", sock_strerror());
+        xpoll_close(xp);
+        return;
+    }
 
-        int nfds = select(ctx->udp_fd + 1, &readfds, NULL, NULL, &tv);
-        if (nfds < 0) {
-            if (sock_errno() == EINTR
+    while (running) {
+        struct xpoll_event events[1];
+        int n = xpoll_wait(xp, events, 1, 1000);
+        if (n < 0) {
+            int se = sock_errno();
+            if (se == EINTR
 #ifdef _WIN32
-                || sock_errno() == WSAEINTR
+                || se == WSAEINTR
 #endif
                ) continue;
-            fprintf(stderr, "select failed: %s\n", sock_strerror());
+            fprintf(stderr, "xpoll_wait failed: %s\n", sock_strerror());
             break;
         }
-
-        if (FD_ISSET(ctx->udp_fd, &readfds)) {
+        if (n > 0 && (events[0].events & XPOLLIN)) {
             char buf[MAX_MSG_SIZE];
             struct sockaddr_in src_addr;
 #ifdef _WIN32
@@ -85,6 +91,8 @@ void server_run(struct server_context *ctx) {
             last_timeout_check = now;
         }
     }
+
+    xpoll_close(xp);
 }
 
 void server_cleanup(struct server_context *ctx) {

@@ -5,7 +5,7 @@ set(CMAKE_C_STANDARD 99)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 
 # Common sources
-set(COMMON_SOURCES utils.c)
+set(COMMON_SOURCES utils.c xpoll.c)
 
 # Server
 add_executable(p2p_server
