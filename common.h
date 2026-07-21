@@ -8,7 +8,7 @@
 #ifdef _WIN32
 #include <winsock2.h>
 #include <ws2tcpip.h>
-#include <BaseTsd.h>
+#include <basetsd.h>
 typedef SSIZE_T ssize_t;
 #pragma comment(lib, "ws2_32.lib")
 #else
@@ -33,6 +33,10 @@ typedef SSIZE_T ssize_t;
 #define MSG_RESET_ACK      0x0A
 #define MSG_PUNCH_ECHO     0x0B
 #define MSG_PUNCH_ACK      0x0C
+#define MSG_LOGIN_V2       0x0D
+#define MSG_LOGIN_RESP_V2  0x0E
+#define MSG_PUNCH_NOTIFY_V2 0x0F
+#define MSG_RESET_NOTIFY_V2 0x10
 
 /* Message header */
 struct msg_header {
@@ -62,8 +66,14 @@ struct client_info {
     struct sockaddr_in public_addr;
 };
 
+/* Heartbeat request body */
+struct heartbeat_req {
+    char id[32];
+};
+
 /* Punch request body */
 struct punch_req {
+    char id[32];
     char target_id[32];
 };
 
@@ -77,6 +87,7 @@ struct punch_notify {
 
 /* Reset punch body (request) */
 struct reset_punch {
+    char id[32];
     char peer_id[32];
 };
 
@@ -94,6 +105,49 @@ struct reset_notify {
 struct p2p_data_header {
     uint32_t session_id;
     uint32_t seq;
+};
+
+/* V2 login request */
+struct login_req_v2 {
+    char id[32];
+    uint32_t vip;
+    uint8_t mac[6];
+    struct sockaddr_in local_addr;
+};
+
+/* V2 login response body */
+struct login_resp_v2 {
+    struct sockaddr_in public_addr;
+    uint32_t client_count;
+};
+
+/* V2 client info */
+struct client_info_v2 {
+    char id[32];
+    uint32_t vip;
+    uint8_t mac[6];
+    struct sockaddr_in public_addr;
+    struct sockaddr_in local_addr;
+};
+
+/* V2 punch notify */
+struct punch_notify_v2 {
+    char peer_id[32];
+    uint32_t peer_vip;
+    uint8_t peer_mac[6];
+    struct sockaddr_in peer_public;
+    struct sockaddr_in peer_local;
+};
+
+/* V2 reset notify */
+struct reset_notify_v2 {
+    uint32_t notify_seq;
+    char peer_id[32];
+    uint32_t peer_vip;
+    uint8_t peer_mac[6];
+    struct sockaddr_in peer_new_public;
+    struct sockaddr_in peer_new_local;
+    uint32_t new_session_id;
 };
 
 /* Punch echo body */
@@ -135,6 +189,7 @@ struct peer_session {
     uint32_t vip;
     uint8_t mac[6];
     struct sockaddr_in public_addr;
+    struct sockaddr_in local_addr;
     enum peer_state state;
     uint32_t session_id;
     uint32_t tx_seq;
@@ -143,6 +198,7 @@ struct peer_session {
     time_t last_tx_time;
     int punch_attempts;
     time_t last_punch_time;
+    int lan_phase;
     uint32_t reset_notify_seq;
     int reset_ack_received;
     int reset_retries;
@@ -156,6 +212,7 @@ struct server_client {
     uint32_t vip;
     uint8_t mac[6];
     struct sockaddr_in public_addr;
+    struct sockaddr_in local_addr;
     time_t last_heartbeat;
     struct server_client *next;
 };

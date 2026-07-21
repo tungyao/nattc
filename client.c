@@ -13,10 +13,12 @@
 #include <linux/if.h>
 #include <linux/if_tun.h>
 #include <net/route.h>
+#include <ifaddrs.h>
 #else
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
+#include <iphlpapi.h>
 /* Wintun API declarations (loaded at runtime) */
 typedef void* (*WintunCreateAdapter_t)(const wchar_t*, const wchar_t*, const void*);
 typedef void* (*WintunStartSession_t)(void*, uint32_t);
@@ -47,6 +49,8 @@ int client_init(struct client_context *ctx, const char *server_ip, uint16_t serv
     ctx->arp_table = NULL;
     ctx->peers = NULL;
     ctx->last_heartbeat = 0;
+    ctx->punch_failures = 0;
+    memset(&ctx->server_observed_addr, 0, sizeof(ctx->server_observed_addr));
 
 #ifndef _WIN32
     srand(time(NULL) ^ getpid());
@@ -110,8 +114,93 @@ int client_init(struct client_context *ctx, const char *server_ip, uint16_t serv
         return -1;
     }
 
+    client_discover_local_addr(ctx);
+
     printf("Client initialized: id=%s vip=%s\n", client_id, virtual_ip);
     return 0;
+}
+
+int is_rfc1918(struct in_addr addr) {
+    uint8_t *b = (uint8_t*)&addr.s_addr;
+    return (b[0] == 10) ||
+           (b[0] == 172 && b[1] >= 16 && b[1] <= 31) ||
+           (b[0] == 192 && b[1] == 168);
+}
+
+void client_discover_local_addr(struct client_context *ctx) {
+    memset(&ctx->local_addr, 0, sizeof(ctx->local_addr));
+#ifndef _WIN32
+    struct ifaddrs *ifaddr, *ifa;
+    if (getifaddrs(&ifaddr) < 0) { perror("getifaddrs"); return; }
+
+    for (ifa = ifaddr; ifa != NULL; ifa = ifa->ifa_next) {
+        if (ifa->ifa_addr == NULL || ifa->ifa_addr->sa_family != AF_INET)
+            continue;
+
+        if (ifa->ifa_flags & IFF_LOOPBACK)
+            continue;
+
+        if (ifa->ifa_flags & IFF_POINTOPOINT)
+            continue;
+
+        if (ifa->ifa_name != NULL && strncmp(ifa->ifa_name, "tun_", 4) == 0)
+            continue;
+
+        struct sockaddr_in *sin = (struct sockaddr_in*)ifa->ifa_addr;
+        if (is_rfc1918(sin->sin_addr)) {
+            ctx->local_addr = *sin;
+            char ip[INET_ADDRSTRLEN];
+            inet_ntop(AF_INET, &sin->sin_addr, ip, sizeof(ip));
+            printf("Discovered local address: %s on %s\n", ip, ifa->ifa_name);
+            break;
+        }
+    }
+    freeifaddrs(ifaddr);
+#else
+    /* Windows implementation using GetAdaptersAddresses */
+    ULONG buf_size = 15000;
+    PIP_ADAPTER_ADDRESSES adapters = (PIP_ADAPTER_ADDRESSES)malloc(buf_size);
+    if (!adapters) return;
+
+    ULONG ret = GetAdaptersAddresses(AF_INET, 0, NULL, adapters, &buf_size);
+    if (ret == ERROR_BUFFER_OVERFLOW) {
+        free(adapters);
+        adapters = (PIP_ADAPTER_ADDRESSES)malloc(buf_size);
+        if (!adapters) return;
+        ret = GetAdaptersAddresses(AF_INET, 0, NULL, adapters, &buf_size);
+    }
+
+    if (ret == NO_ERROR) {
+        PIP_ADAPTER_ADDRESSES adapter = adapters;
+        while (adapter) {
+            if (adapter->IfType == IF_TYPE_SOFTWARE_LOOPBACK) {
+                adapter = adapter->Next;
+                continue;
+            }
+            char name_buf[64];
+            wcstombs(name_buf, adapter->FriendlyName, sizeof(name_buf));
+            if (strncmp(name_buf, "tun_", 4) == 0) {
+                adapter = adapter->Next;
+                continue;
+            }
+            PIP_ADAPTER_UNICAST_ADDRESS addr = adapter->FirstUnicastAddress;
+            while (addr) {
+                struct sockaddr_in *sin = (struct sockaddr_in*)addr->Address.lpSockaddr;
+                if (sin->sin_family == AF_INET && is_rfc1918(sin->sin_addr)) {
+                    ctx->local_addr = *sin;
+                    char ip[INET_ADDRSTRLEN];
+                    inet_ntop(AF_INET, &sin->sin_addr, ip, sizeof(ip));
+                    printf("Discovered local address: %s\n", ip);
+                    goto done;
+                }
+                addr = addr->Next;
+            }
+            adapter = adapter->Next;
+        }
+    }
+done:
+    free(adapters);
+#endif
 }
 
 /* ============ TUN implementations ============ */
@@ -453,6 +542,7 @@ struct peer_session* peer_add(struct client_context *ctx, const char *id, uint32
     peer->vip = vip;
     if (mac) memcpy(peer->mac, mac, 6);
     peer->state = PEER_STATE_IDLE;
+    peer->lan_phase = 0;
     peer->next = ctx->peers;
     ctx->peers = peer;
     printf("Peer added: %s\n", id);
@@ -477,6 +567,7 @@ void peer_clear_all_mappings(struct client_context *ctx, const char *peer_id, ui
     peer->rx_seq = 0;
     peer->punch_attempts = 0;
     peer->last_punch_time = 0;
+    peer->lan_phase = 0;
     peer->reset_ack_received = 0;
     peer->reset_retries = 0;
     peer->last_reset_time = 0;
@@ -490,12 +581,22 @@ void client_run(struct client_context *ctx) {
     time_t last_timeout_check = time(NULL);
 
     /* Send login to server */
-    struct login_req login;
-    memset(&login, 0, sizeof(login));
-    strncpy(login.id, ctx->id, sizeof(login.id) - 1);
-    login.vip = ctx->vip;
-    memcpy(login.mac, ctx->mac, 6);
-    send_msg(ctx->udp_fd, &ctx->server_addr, MSG_LOGIN, 0, &login, sizeof(login));
+    if (ctx->local_addr.sin_addr.s_addr != 0) {
+        struct login_req_v2 login;
+        memset(&login, 0, sizeof(login));
+        strncpy(login.id, ctx->id, sizeof(login.id) - 1);
+        login.vip = ctx->vip;
+        memcpy(login.mac, ctx->mac, 6);
+        login.local_addr = ctx->local_addr;
+        send_msg(ctx->udp_fd, &ctx->server_addr, MSG_LOGIN_V2, 0, &login, sizeof(login));
+    } else {
+        struct login_req login;
+        memset(&login, 0, sizeof(login));
+        strncpy(login.id, ctx->id, sizeof(login.id) - 1);
+        login.vip = ctx->vip;
+        memcpy(login.mac, ctx->mac, 6);
+        send_msg(ctx->udp_fd, &ctx->server_addr, MSG_LOGIN, 0, &login, sizeof(login));
+    }
     ctx->last_heartbeat = time(NULL);
     ctx->login_sent_time = time(NULL);
     ctx->login_received = 0;
@@ -694,9 +795,12 @@ void client_handle_message(struct client_context *ctx, const struct sockaddr_in 
     if (len < sizeof(struct msg_header) + body_len) { fprintf(stderr, "Message truncated\n"); return; }
     const void *body = (const char*)msg + sizeof(struct msg_header);
     switch (type) {
-        case MSG_LOGIN_RESP:   client_handle_login_resp(ctx, (const struct login_resp*)body, body_len); break;
-        case MSG_PUNCH_NOTIFY: client_handle_punch_notify(ctx, (const struct punch_notify*)body); break;
-        case MSG_RESET_NOTIFY: client_handle_reset_notify(ctx, (const struct reset_notify*)body); break;
+        case MSG_LOGIN_RESP:      client_handle_login_resp(ctx, (const struct login_resp*)body, body_len, type); break;
+        case MSG_LOGIN_RESP_V2:   client_handle_login_resp_v2(ctx, (const struct login_resp_v2*)body, body_len); break;
+        case MSG_PUNCH_NOTIFY:    client_handle_punch_notify(ctx, (const struct punch_notify*)body, type); break;
+        case MSG_PUNCH_NOTIFY_V2: client_handle_punch_notify_v2(ctx, (const struct punch_notify_v2*)body); break;
+        case MSG_RESET_NOTIFY:    client_handle_reset_notify(ctx, (const struct reset_notify*)body, type); break;
+        case MSG_RESET_NOTIFY_V2: client_handle_reset_notify_v2(ctx, (const struct reset_notify_v2*)body); break;
         case MSG_PUNCH_ECHO:   client_handle_punch_echo(ctx, src_addr, (const struct punch_echo*)body); break;
         case MSG_PUNCH_ACK:    client_handle_punch_ack(ctx, (const struct punch_ack*)body); break;
         case MSG_P2P_DATA:
@@ -709,8 +813,10 @@ void client_handle_message(struct client_context *ctx, const struct sockaddr_in 
     }
 }
 
-void client_handle_login_resp(struct client_context *ctx, const struct login_resp *resp, uint32_t body_len) {
+void client_handle_login_resp(struct client_context *ctx, const struct login_resp *resp, uint32_t body_len, uint16_t type) {
+    (void)type;
     ctx->login_received = 1;
+    ctx->server_observed_addr = resp->public_addr;
     printf("Login response: server observed address ");
     print_addr(&resp->public_addr);
     printf("\n");
@@ -721,16 +827,52 @@ void client_handle_login_resp(struct client_context *ctx, const struct login_res
         arp_add(ctx, info[i].vip, info[i].mac, info[i].id);
         struct peer_session *peer = peer_find(ctx, info[i].id);
         if (!peer) peer = peer_add(ctx, info[i].id, info[i].vip, info[i].mac);
-        if (peer) peer->public_addr = info[i].public_addr;
+        if (peer) {
+            peer->public_addr = info[i].public_addr;
+            memset(&peer->local_addr, 0, sizeof(peer->local_addr));
+        }
         printf("  Requesting punch for peer %s\n", info[i].id);
         struct punch_req req;
         memset(&req, 0, sizeof(req));
+        strncpy(req.id, ctx->id, sizeof(req.id) - 1);
         strncpy(req.target_id, info[i].id, sizeof(req.target_id) - 1);
         send_msg(ctx->udp_fd, &ctx->server_addr, MSG_PUNCH_REQ, 0, &req, sizeof(req));
     }
 }
 
-void client_handle_punch_notify(struct client_context *ctx, const struct punch_notify *notify) {
+void client_handle_login_resp_v2(struct client_context *ctx, const struct login_resp_v2 *resp, uint32_t body_len) {
+    ctx->login_received = 1;
+    ctx->server_observed_addr = resp->public_addr;
+    printf("Login response (V2): server observed address ");
+    print_addr(&resp->public_addr);
+    printf("\n");
+    uint32_t count = ntohl(resp->client_count);
+    const struct client_info_v2 *info = (const struct client_info_v2*)(resp + 1);
+    for (uint32_t i = 0; i < count; i++) {
+        printf("  Known peer: %s vip=%08x", info[i].id, info[i].vip);
+        if (info[i].local_addr.sin_addr.s_addr != 0) {
+            printf(" local=");
+            print_addr(&info[i].local_addr);
+        }
+        printf("\n");
+        arp_add(ctx, info[i].vip, info[i].mac, info[i].id);
+        struct peer_session *peer = peer_find(ctx, info[i].id);
+        if (!peer) peer = peer_add(ctx, info[i].id, info[i].vip, info[i].mac);
+        if (peer) {
+            peer->public_addr = info[i].public_addr;
+            peer->local_addr = info[i].local_addr;
+        }
+        printf("  Requesting punch for peer %s\n", info[i].id);
+        struct punch_req req;
+        memset(&req, 0, sizeof(req));
+        strncpy(req.id, ctx->id, sizeof(req.id) - 1);
+        strncpy(req.target_id, info[i].id, sizeof(req.target_id) - 1);
+        send_msg(ctx->udp_fd, &ctx->server_addr, MSG_PUNCH_REQ, 0, &req, sizeof(req));
+    }
+}
+
+void client_handle_punch_notify(struct client_context *ctx, const struct punch_notify *notify, uint16_t type) {
+    (void)type;
     printf("Punch notify: peer %s at ", notify->peer_id);
     print_addr(&notify->peer_public);
     printf("\n");
@@ -744,6 +886,7 @@ void client_handle_punch_notify(struct client_context *ctx, const struct punch_n
     struct peer_session *peer = peer_find(ctx, notify->peer_id);
     if (!peer) { peer = peer_add(ctx, notify->peer_id, notify->peer_vip, notify->peer_mac); if (!peer) return; }
     peer->public_addr = notify->peer_public;
+    memset(&peer->local_addr, 0, sizeof(peer->local_addr));
     if (notify->peer_vip) peer->vip = notify->peer_vip;
     memcpy(peer->mac, notify->peer_mac, 6);
     arp_add(ctx, notify->peer_vip, notify->peer_mac, notify->peer_id);
@@ -760,7 +903,43 @@ void client_handle_punch_notify(struct client_context *ctx, const struct punch_n
     }
 }
 
-void client_handle_reset_notify(struct client_context *ctx, const struct reset_notify *notify) {
+void client_handle_punch_notify_v2(struct client_context *ctx, const struct punch_notify_v2 *notify) {
+    printf("Punch notify V2: peer %s at ", notify->peer_id);
+    print_addr(&notify->peer_public);
+    if (notify->peer_local.sin_addr.s_addr != 0) {
+        printf(" local=");
+        print_addr(&notify->peer_local);
+    }
+    printf("\n");
+    if (notify->peer_public.sin_addr.s_addr == 0 && notify->peer_public.sin_port == 0) {
+        printf("Peer %s is offline\n", notify->peer_id);
+        struct peer_session *peer = peer_find(ctx, notify->peer_id);
+        if (peer && (peer->state == PEER_STATE_PUNCHING || peer->state == PEER_STATE_RESETTING))
+            peer->state = PEER_STATE_IDLE;
+        return;
+    }
+    struct peer_session *peer = peer_find(ctx, notify->peer_id);
+    if (!peer) { peer = peer_add(ctx, notify->peer_id, notify->peer_vip, notify->peer_mac); if (!peer) return; }
+    peer->public_addr = notify->peer_public;
+    peer->local_addr = notify->peer_local;
+    if (notify->peer_vip) peer->vip = notify->peer_vip;
+    memcpy(peer->mac, notify->peer_mac, 6);
+    arp_add(ctx, notify->peer_vip, notify->peer_mac, notify->peer_id);
+
+    if (peer->state == PEER_STATE_ESTABLISHED) {
+        printf("Peer %s reconnected (was established), re-punching\n", notify->peer_id);
+        peer_clear_all_mappings(ctx, notify->peer_id, notify->peer_vip);
+        arp_add(ctx, notify->peer_vip, notify->peer_mac, notify->peer_id);
+        client_start_punching(ctx, peer);
+        return;
+    }
+    if (peer->state == PEER_STATE_IDLE) {
+        client_start_punching(ctx, peer);
+    }
+}
+
+void client_handle_reset_notify(struct client_context *ctx, const struct reset_notify *notify, uint16_t type) {
+    (void)type;
     uint32_t notify_seq = ntohl(notify->notify_seq);
     printf("Reset notify: peer %s seq=%u\n", notify->peer_id, notify_seq);
     struct peer_session *peer = peer_find(ctx, notify->peer_id);
@@ -772,6 +951,32 @@ void client_handle_reset_notify(struct client_context *ctx, const struct reset_n
     peer_clear_all_mappings(ctx, notify->peer_id, notify->peer_vip);
     if (notify->peer_new_public.sin_addr.s_addr != 0)
         peer->public_addr = notify->peer_new_public;
+    memset(&peer->local_addr, 0, sizeof(peer->local_addr));
+    if (notify->peer_vip) peer->vip = notify->peer_vip;
+    memcpy(peer->mac, notify->peer_mac, 6);
+    peer->session_id = ntohl(notify->new_session_id);
+    peer->reset_notify_seq = notify_seq;
+    arp_add(ctx, notify->peer_vip, notify->peer_mac, notify->peer_id);
+    send_msg(ctx->udp_fd, &ctx->server_addr, MSG_RESET_ACK, notify_seq, NULL, 0);
+    if (notify->peer_new_public.sin_addr.s_addr != 0)
+        client_start_punching(ctx, peer);
+    else
+        peer->state = PEER_STATE_IDLE;
+}
+
+void client_handle_reset_notify_v2(struct client_context *ctx, const struct reset_notify_v2 *notify) {
+    uint32_t notify_seq = ntohl(notify->notify_seq);
+    printf("Reset notify V2: peer %s seq=%u\n", notify->peer_id, notify_seq);
+    struct peer_session *peer = peer_find(ctx, notify->peer_id);
+    if (!peer) { peer = peer_add(ctx, notify->peer_id, notify->peer_vip, notify->peer_mac); if (!peer) return; }
+    if (peer->reset_notify_seq == notify_seq && peer->state == PEER_STATE_PUNCHING) {
+        send_msg(ctx->udp_fd, &ctx->server_addr, MSG_RESET_ACK, notify_seq, NULL, 0);
+        return;
+    }
+    peer_clear_all_mappings(ctx, notify->peer_id, notify->peer_vip);
+    if (notify->peer_new_public.sin_addr.s_addr != 0)
+        peer->public_addr = notify->peer_new_public;
+    peer->local_addr = notify->peer_new_local;
     if (notify->peer_vip) peer->vip = notify->peer_vip;
     memcpy(peer->mac, notify->peer_mac, 6);
     peer->session_id = ntohl(notify->new_session_id);
@@ -815,6 +1020,8 @@ void client_handle_punch_echo(struct client_context *ctx, const struct sockaddr_
     send_msg(ctx->udp_fd, src_addr, MSG_PUNCH_ACK, 0, &ack, sizeof(ack));
     peer->state = PEER_STATE_ESTABLISHED;
     peer->punch_attempts = 0;
+    peer->lan_phase = LAN_PHASE_NONE;
+    ctx->punch_failures = 0;
     fprintf(stderr, "*** PUNCH SUCCEEDED with peer %s (session=%u) ***\n",
             peer->id, peer->session_id);
     struct punch_echo our_echo;
@@ -835,6 +1042,8 @@ void client_handle_punch_ack(struct client_context *ctx, const struct punch_ack 
             peer->state = PEER_STATE_ESTABLISHED;
             peer->last_rx_time = time(NULL);
             peer->punch_attempts = 0;
+            peer->lan_phase = LAN_PHASE_NONE;
+            ctx->punch_failures = 0;
             fprintf(stderr, "*** PUNCH ACK — session established with %s (session=%u) ***\n",
                     peer->id, peer->session_id);
             struct punch_echo our_echo;
@@ -889,31 +1098,63 @@ void client_handle_heartbeat_resp(struct client_context *ctx, const struct heart
     printf("Heartbeat response: server sees us at ");
     print_addr(&resp->public_addr);
     printf("\n");
+
+    if (ctx->login_received &&
+        (ctx->server_observed_addr.sin_addr.s_addr != resp->public_addr.sin_addr.s_addr ||
+         ctx->server_observed_addr.sin_port != resp->public_addr.sin_port)) {
+        printf("NAT address changed! Old="); print_addr(&ctx->server_observed_addr);
+        printf(" New="); print_addr(&resp->public_addr);
+        printf(" — re-logging in...\n");
+        client_resend_login(ctx);
+    }
+    ctx->server_observed_addr = resp->public_addr;
 }
 
 /* ============ Punching logic ============ */
 
 void client_start_punching(struct client_context *ctx, struct peer_session *peer) {
-    printf("Starting punch to %s at ", peer->id);
-    print_addr(&peer->public_addr);
-    printf("\n");
     peer->state = PEER_STATE_PUNCHING;
     peer->punch_attempts = 0;
     peer->last_punch_time = 0;
     peer->last_rx_time = time(NULL);
     peer->session_id = rand();
+
+    if (peer->local_addr.sin_addr.s_addr != 0 &&
+        peer->local_addr.sin_addr.s_addr != peer->public_addr.sin_addr.s_addr) {
+        peer->lan_phase = LAN_PHASE_LAN;
+        printf("Starting LAN-phase punch to %s at ", peer->id);
+        print_addr(&peer->local_addr);
+        printf("\n");
+    } else {
+        peer->lan_phase = LAN_PHASE_NONE;
+        printf("Starting WAN-phase punch to %s at ", peer->id);
+        print_addr(&peer->public_addr);
+        printf("\n");
+    }
+
     client_send_punch_echo(ctx, peer);
 }
 
 void client_send_punch_echo(struct client_context *ctx, struct peer_session *peer) {
+    struct sockaddr_in *target;
+
+    if (peer->lan_phase == LAN_PHASE_LAN) {
+        target = &peer->local_addr;
+        target->sin_port = peer->public_addr.sin_port;
+    } else {
+        target = &peer->public_addr;
+    }
+
     struct punch_echo echo;
     strncpy(echo.peer_id, ctx->id, sizeof(echo.peer_id) - 1);
     echo.peer_id[sizeof(echo.peer_id) - 1] = '\0';
     echo.session_id = htonl(peer->session_id);
     printf("Sending punch echo to %s at ", peer->id);
-    print_addr(&peer->public_addr);
-    printf(" (attempt %d)\n", peer->punch_attempts + 1);
-    send_msg(ctx->udp_fd, &peer->public_addr, MSG_PUNCH_ECHO, 0, &echo, sizeof(echo));
+    print_addr(target);
+    printf(" (phase=%s attempt=%d)\n",
+           peer->lan_phase == LAN_PHASE_LAN ? "LAN" : "WAN",
+           peer->punch_attempts + 1);
+    send_msg(ctx->udp_fd, target, MSG_PUNCH_ECHO, 0, &echo, sizeof(echo));
     peer->punch_attempts++;
     peer->last_punch_time = time(NULL);
 }
@@ -921,10 +1162,41 @@ void client_send_punch_echo(struct client_context *ctx, struct peer_session *pee
 void client_update_punch_state(struct client_context *ctx, struct peer_session *peer) {
     time_t now = time(NULL);
     if (peer->state == PEER_STATE_PUNCHING || peer->state == PEER_STATE_RESETTING) {
+        if (peer->lan_phase == LAN_PHASE_LAN) {
+            if ((now - peer->last_rx_time) > LAN_PUNCH_TIMEOUT_SEC) {
+                printf("LAN phase timed out for peer %s (attempts=%d), switching to WAN phase\n",
+                       peer->id, peer->punch_attempts);
+                peer->lan_phase = LAN_PHASE_NONE;
+                peer->punch_attempts = 0;
+                peer->last_punch_time = 0;
+                peer->last_rx_time = now;
+                client_send_punch_echo(ctx, peer);
+                return;
+            }
+            long elapsed_ms = (long)(now - peer->last_punch_time) * 1000;
+            if (peer->punch_attempts < LAN_PUNCH_ATTEMPTS_MAX && elapsed_ms >= LAN_PUNCH_INTERVAL_MS)
+                client_send_punch_echo(ctx, peer);
+            return;
+        }
         if ((now - peer->last_rx_time) > PUNCH_TIMEOUT_SEC) {
-            fprintf(stderr, "*** PUNCH TIMEOUT for peer %s after %d attempts ***\n",
-                    peer->id, peer->punch_attempts);
+            ctx->punch_failures++;
+            fprintf(stderr, "*** PUNCH TIMEOUT for peer %s after %d attempts (total failures: %d) ***\n",
+                    peer->id, peer->punch_attempts, ctx->punch_failures);
             peer->state = PEER_STATE_IDLE;
+
+            if (ctx->punch_failures >= PUNCH_REBIND_THRESHOLD) {
+                printf("Too many punch failures (%d), rebinding UDP socket and re-logging in...\n",
+                       ctx->punch_failures);
+                ctx->punch_failures = 0;
+
+                if (client_rebind_udp(ctx) < 0) {
+                    fprintf(stderr, "UDP rebind failed, continuing with old socket\n");
+                    return;
+                }
+
+                client_resend_login(ctx);
+                printf("Re-login sent, peers will be re-punched on login response\n");
+            }
             return;
         }
         int interval_ms = (peer->punch_attempts < PUNCH_ATTEMPTS_FIRST)
@@ -1032,23 +1304,75 @@ void client_send_arp_reply(struct client_context *ctx, const uint8_t *pkt, uint3
            ip_str, arp->mac[0], arp->mac[1], arp->mac[2], arp->mac[3], arp->mac[4], arp->mac[5]);
 }
 
+/* ============ UDP socket rebind ============ */
+
+int client_rebind_udp(struct client_context *ctx) {
+    printf("Rebinding UDP socket (old fd=%d)...\n", ctx->udp_fd);
+    sock_close(ctx->udp_fd);
+
+    ctx->udp_fd = create_udp_socket();
+    if (ctx->udp_fd < 0) {
+        fprintf(stderr, "Failed to create new UDP socket: %s\n", sock_strerror());
+        return -1;
+    }
+    if (set_nonblocking(ctx->udp_fd) < 0) {
+        fprintf(stderr, "Failed to set new UDP socket non-blocking\n");
+        sock_close(ctx->udp_fd);
+        ctx->udp_fd = -1;
+        return -1;
+    }
+    printf("New UDP socket created (fd=%d)\n", ctx->udp_fd);
+    return 0;
+}
+
+void client_resend_login(struct client_context *ctx) {
+    if (ctx->local_addr.sin_addr.s_addr != 0) {
+        struct login_req_v2 login;
+        memset(&login, 0, sizeof(login));
+        strncpy(login.id, ctx->id, sizeof(login.id) - 1);
+        login.vip = ctx->vip;
+        memcpy(login.mac, ctx->mac, 6);
+        login.local_addr = ctx->local_addr;
+        send_msg(ctx->udp_fd, &ctx->server_addr, MSG_LOGIN_V2, 0, &login, sizeof(login));
+    } else {
+        struct login_req login;
+        memset(&login, 0, sizeof(login));
+        strncpy(login.id, ctx->id, sizeof(login.id) - 1);
+        login.vip = ctx->vip;
+        memcpy(login.mac, ctx->mac, 6);
+        send_msg(ctx->udp_fd, &ctx->server_addr, MSG_LOGIN, 0, &login, sizeof(login));
+    }
+    ctx->login_sent_time = time(NULL);
+}
+
 /* ============ Heartbeat ============ */
 
 void client_send_heartbeat(struct client_context *ctx) {
-    send_msg(ctx->udp_fd, &ctx->server_addr, MSG_HEARTBEAT, 0, NULL, 0);
+    struct heartbeat_req req;
+    memset(&req, 0, sizeof(req));
+    strncpy(req.id, ctx->id, sizeof(req.id) - 1);
+    send_msg(ctx->udp_fd, &ctx->server_addr, MSG_HEARTBEAT, 0, &req, sizeof(req));
 }
 
 /* ============ Keepalive ============ */
 
 void client_send_keepalive(struct client_context *ctx, struct peer_session *peer) {
     if (peer->state != PEER_STATE_ESTABLISHED) return;
-    /* Send PUNCH_ECHO as lightweight keepalive to keep NAT mapping alive */
     peer->last_tx_time = time(NULL);
     struct punch_echo echo;
     strncpy(echo.peer_id, ctx->id, sizeof(echo.peer_id) - 1);
     echo.peer_id[sizeof(echo.peer_id) - 1] = '\0';
     echo.session_id = htonl(peer->session_id);
+
+    /* Keep working path alive */
     send_msg(ctx->udp_fd, &peer->public_addr, MSG_PUNCH_ECHO, 0, &echo, sizeof(echo));
+
+    /* Also keep LAN path alive if different from working path */
+    if (peer->local_addr.sin_addr.s_addr != 0 &&
+        (peer->local_addr.sin_addr.s_addr != peer->public_addr.sin_addr.s_addr ||
+         peer->local_addr.sin_port != peer->public_addr.sin_port)) {
+        send_msg(ctx->udp_fd, &peer->local_addr, MSG_PUNCH_ECHO, 0, &echo, sizeof(echo));
+    }
 }
 
 void client_initiate_reset(struct client_context *ctx, struct peer_session *peer) {
@@ -1056,6 +1380,7 @@ void client_initiate_reset(struct client_context *ctx, struct peer_session *peer
     peer_clear_all_mappings(ctx, peer->id, peer->vip);
     struct reset_punch req;
     memset(&req, 0, sizeof(req));
+    strncpy(req.id, ctx->id, sizeof(req.id) - 1);
     strncpy(req.peer_id, peer->id, sizeof(req.peer_id) - 1);
     send_msg(ctx->udp_fd, &ctx->server_addr, MSG_RESET_PUNCH, 0, &req, sizeof(req));
 }

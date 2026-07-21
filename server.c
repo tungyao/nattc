@@ -108,8 +108,9 @@ void server_handle_message(struct server_context *ctx, const struct sockaddr_in 
     if (len < sizeof(struct msg_header) + body_len) { fprintf(stderr, "Message truncated\n"); return; }
     const void *body = (const char*)msg + sizeof(struct msg_header);
     switch (type) {
-        case MSG_LOGIN:       server_handle_login(ctx, src_addr, (const struct login_req*)body); break;
-        case MSG_HEARTBEAT:   server_handle_heartbeat(ctx, src_addr, hdr); break;
+        case MSG_LOGIN:       server_handle_login(ctx, src_addr, (const struct login_req*)body, type); break;
+        case MSG_LOGIN_V2:    server_handle_login(ctx, src_addr, (const struct login_req_v2*)body, type); break;
+        case MSG_HEARTBEAT:   server_handle_heartbeat(ctx, src_addr, hdr, (const struct heartbeat_req*)body); break;
         case MSG_PUNCH_REQ:   server_handle_punch_req(ctx, src_addr, (const struct punch_req*)body); break;
         case MSG_RESET_PUNCH: server_handle_reset_punch(ctx, src_addr, (const struct reset_punch*)body); break;
         case MSG_RESET_ACK:   server_handle_reset_ack(ctx, src_addr, hdr); break;
@@ -117,7 +118,19 @@ void server_handle_message(struct server_context *ctx, const struct sockaddr_in 
     }
 }
 
-void server_handle_login(struct server_context *ctx, const struct sockaddr_in *src_addr, const struct login_req *req) {
+static int is_valid_local_addr(struct in_addr addr) {
+    uint32_t ip = ntohl(addr.s_addr);
+    if (ip == 0) return 0;
+    if ((ip & 0xFF000000) == 0x7F000000) return 0;
+    if ((ip & 0xFFFF0000) == 0xA9FE0000) return 0;
+    uint8_t *b = (uint8_t*)&addr.s_addr;
+    return (b[0] == 10) ||
+           (b[0] == 172 && b[1] >= 16 && b[1] <= 31) ||
+           (b[0] == 192 && b[1] == 168);
+}
+
+void server_handle_login(struct server_context *ctx, const struct sockaddr_in *src_addr, const void *body, uint16_t type) {
+    const struct login_req *req = (const struct login_req*)body;
     printf("Login request from "); print_addr(src_addr); printf(" id=%s\n", req->id);
     struct server_client *client = server_find_client(ctx, req->id);
     if (client) {
@@ -125,6 +138,15 @@ void server_handle_login(struct server_context *ctx, const struct sockaddr_in *s
         client->vip = req->vip;
         memcpy(client->mac, req->mac, 6);
         client->last_heartbeat = time(NULL);
+        if (type == MSG_LOGIN_V2) {
+            const struct login_req_v2 *req2 = (const struct login_req_v2*)body;
+            if (is_valid_local_addr(req2->local_addr.sin_addr))
+                client->local_addr = req2->local_addr;
+            else
+                memset(&client->local_addr, 0, sizeof(client->local_addr));
+        } else {
+            memset(&client->local_addr, 0, sizeof(client->local_addr));
+        }
     } else {
         client = (struct server_client*)malloc(sizeof(struct server_client));
         if (!client) { perror("malloc"); return; }
@@ -132,93 +154,146 @@ void server_handle_login(struct server_context *ctx, const struct sockaddr_in *s
         client->vip = req->vip;
         memcpy(client->mac, req->mac, 6);
         client->public_addr = *src_addr;
+        if (type == MSG_LOGIN_V2) {
+            const struct login_req_v2 *req2 = (const struct login_req_v2*)body;
+            if (is_valid_local_addr(req2->local_addr.sin_addr))
+                client->local_addr = req2->local_addr;
+            else
+                memset(&client->local_addr, 0, sizeof(client->local_addr));
+        } else {
+            memset(&client->local_addr, 0, sizeof(client->local_addr));
+        }
         client->last_heartbeat = time(NULL);
         client->next = ctx->clients;
         ctx->clients = client;
     }
 
-    struct login_resp resp;
-    resp.public_addr = *src_addr;
-    uint32_t count = 0;
+    int use_v2 = 0;
     struct server_client *c = ctx->clients;
-    while (c) { if (strcmp(c->id, req->id) != 0) count++; c = c->next; }
-    resp.client_count = htonl(count);
-
-    size_t body_size = sizeof(resp) + count * sizeof(struct client_info);
-    char *body = (char*)malloc(body_size);
-    if (!body) { perror("malloc"); return; }
-    memcpy(body, &resp, sizeof(resp));
-    struct client_info *info = (struct client_info*)(body + sizeof(resp));
-    c = ctx->clients;
     while (c) {
-        if (strcmp(c->id, req->id) != 0) {
-            strncpy(info->id, c->id, sizeof(info->id) - 1);
-            info->vip = c->vip;
-            memcpy(info->mac, c->mac, 6);
-            info->public_addr = c->public_addr;
-            info++;
-        }
+        if (strcmp(c->id, req->id) != 0 && c->local_addr.sin_addr.s_addr != 0)
+            use_v2 = 1;
         c = c->next;
     }
-    send_msg(ctx->udp_fd, src_addr, MSG_LOGIN_RESP, 0, body, body_size);
-    free(body);
+
+    if (use_v2) {
+        struct login_resp_v2 resp;
+        resp.public_addr = *src_addr;
+        uint32_t count = 0;
+        struct server_client *cc = ctx->clients;
+        while (cc) { if (strcmp(cc->id, req->id) != 0) count++; cc = cc->next; }
+        resp.client_count = htonl(count);
+
+        size_t body_size = sizeof(resp) + count * sizeof(struct client_info_v2);
+        char *body_buf = (char*)malloc(body_size);
+        if (!body_buf) { perror("malloc"); return; }
+        memcpy(body_buf, &resp, sizeof(resp));
+        struct client_info_v2 *info = (struct client_info_v2*)(body_buf + sizeof(resp));
+        cc = ctx->clients;
+        while (cc) {
+            if (strcmp(cc->id, req->id) != 0) {
+                strncpy(info->id, cc->id, sizeof(info->id) - 1);
+                info->vip = cc->vip;
+                memcpy(info->mac, cc->mac, 6);
+                info->public_addr = cc->public_addr;
+                info->local_addr = cc->local_addr;
+                info++;
+            }
+            cc = cc->next;
+        }
+        send_msg(ctx->udp_fd, src_addr, MSG_LOGIN_RESP_V2, 0, body_buf, body_size);
+        free(body_buf);
+    } else {
+        struct login_resp resp;
+        resp.public_addr = *src_addr;
+        uint32_t count = 0;
+        struct server_client *cc = ctx->clients;
+        while (cc) { if (strcmp(cc->id, req->id) != 0) count++; cc = cc->next; }
+        resp.client_count = htonl(count);
+
+        size_t body_size = sizeof(resp) + count * sizeof(struct client_info);
+        char *body_buf = (char*)malloc(body_size);
+        if (!body_buf) { perror("malloc"); return; }
+        memcpy(body_buf, &resp, sizeof(resp));
+        struct client_info *info = (struct client_info*)(body_buf + sizeof(resp));
+        cc = ctx->clients;
+        while (cc) {
+            if (strcmp(cc->id, req->id) != 0) {
+                strncpy(info->id, cc->id, sizeof(info->id) - 1);
+                info->vip = cc->vip;
+                memcpy(info->mac, cc->mac, 6);
+                info->public_addr = cc->public_addr;
+                info++;
+            }
+            cc = cc->next;
+        }
+        send_msg(ctx->udp_fd, src_addr, MSG_LOGIN_RESP, 0, body_buf, body_size);
+        free(body_buf);
+    }
 }
 
-void server_handle_heartbeat(struct server_context *ctx, const struct sockaddr_in *src_addr, const struct msg_header *hdr) {
-    struct server_client *client = ctx->clients;
-    while (client) {
-        if (client->public_addr.sin_addr.s_addr == src_addr->sin_addr.s_addr &&
-            client->public_addr.sin_port == src_addr->sin_port) {
-            client->last_heartbeat = time(NULL);
-            client->public_addr = *src_addr;
-            struct heartbeat_resp resp;
-            resp.public_addr = *src_addr;
-            send_msg(ctx->udp_fd, src_addr, MSG_HEARTBEAT_RESP, hdr->seq, &resp, sizeof(resp));
-            return;
-        }
-        client = client->next;
+void server_handle_heartbeat(struct server_context *ctx, const struct sockaddr_in *src_addr, const struct msg_header *hdr, const struct heartbeat_req *req) {
+    struct server_client *client = server_find_client(ctx, req->id);
+    if (client) {
+        client->last_heartbeat = time(NULL);
+        client->public_addr = *src_addr;
+        struct heartbeat_resp resp;
+        resp.public_addr = *src_addr;
+        send_msg(ctx->udp_fd, src_addr, MSG_HEARTBEAT_RESP, hdr->seq, &resp, sizeof(resp));
+        return;
     }
-    fprintf(stderr, "Heartbeat from unknown client "); print_addr(src_addr); fprintf(stderr, "\n");
+    fprintf(stderr, "Heartbeat from unknown client "); print_addr(src_addr); fprintf(stderr, " id=%s\n", req->id);
 }
 
 void server_handle_punch_req(struct server_context *ctx, const struct sockaddr_in *src_addr, const struct punch_req *req) {
-    printf("Punch request from "); print_addr(src_addr); printf(" target=%s\n", req->target_id);
-    struct server_client *requester = NULL;
-    struct server_client *c = ctx->clients;
-    while (c) {
-        if (c->public_addr.sin_addr.s_addr == src_addr->sin_addr.s_addr &&
-            c->public_addr.sin_port == src_addr->sin_port) { requester = c; break; }
-        c = c->next;
-    }
-    if (!requester) { fprintf(stderr, "Requester not found\n"); return; }
+    printf("Punch request from "); print_addr(src_addr); printf(" id=%s target=%s\n", req->id, req->target_id);
+    struct server_client *requester = server_find_client(ctx, req->id);
+    if (!requester) { fprintf(stderr, "Requester not found: %s\n", req->id); return; }
+    requester->public_addr = *src_addr;
     struct server_client *target = server_find_client(ctx, req->target_id);
     if (!target) { fprintf(stderr, "Target not found: %s\n", req->target_id); return; }
 
-    struct punch_notify notify_target;
-    strncpy(notify_target.peer_id, target->id, sizeof(notify_target.peer_id) - 1);
-    notify_target.peer_vip = target->vip;
-    memcpy(notify_target.peer_mac, target->mac, 6);
-    notify_target.peer_public = target->public_addr;
-    send_msg(ctx->udp_fd, src_addr, MSG_PUNCH_NOTIFY, 0, &notify_target, sizeof(notify_target));
+    int use_v2 = (requester->local_addr.sin_addr.s_addr != 0 ||
+                  target->local_addr.sin_addr.s_addr != 0);
 
-    struct punch_notify notify_requester;
-    strncpy(notify_requester.peer_id, requester->id, sizeof(notify_requester.peer_id) - 1);
-    notify_requester.peer_vip = requester->vip;
-    memcpy(notify_requester.peer_mac, requester->mac, 6);
-    notify_requester.peer_public = requester->public_addr;
-    send_msg(ctx->udp_fd, &target->public_addr, MSG_PUNCH_NOTIFY, 0, &notify_requester, sizeof(notify_requester));
+    if (use_v2) {
+        struct punch_notify_v2 notify_target;
+        strncpy(notify_target.peer_id, target->id, sizeof(notify_target.peer_id) - 1);
+        notify_target.peer_vip = target->vip;
+        memcpy(notify_target.peer_mac, target->mac, 6);
+        notify_target.peer_public = target->public_addr;
+        notify_target.peer_local = target->local_addr;
+        send_msg(ctx->udp_fd, src_addr, MSG_PUNCH_NOTIFY_V2, 0, &notify_target, sizeof(notify_target));
+
+        struct punch_notify_v2 notify_requester;
+        strncpy(notify_requester.peer_id, requester->id, sizeof(notify_requester.peer_id) - 1);
+        notify_requester.peer_vip = requester->vip;
+        memcpy(notify_requester.peer_mac, requester->mac, 6);
+        notify_requester.peer_public = requester->public_addr;
+        notify_requester.peer_local = requester->local_addr;
+        send_msg(ctx->udp_fd, &target->public_addr, MSG_PUNCH_NOTIFY_V2, 0, &notify_requester, sizeof(notify_requester));
+    } else {
+        struct punch_notify notify_target;
+        strncpy(notify_target.peer_id, target->id, sizeof(notify_target.peer_id) - 1);
+        notify_target.peer_vip = target->vip;
+        memcpy(notify_target.peer_mac, target->mac, 6);
+        notify_target.peer_public = target->public_addr;
+        send_msg(ctx->udp_fd, src_addr, MSG_PUNCH_NOTIFY, 0, &notify_target, sizeof(notify_target));
+
+        struct punch_notify notify_requester;
+        strncpy(notify_requester.peer_id, requester->id, sizeof(notify_requester.peer_id) - 1);
+        notify_requester.peer_vip = requester->vip;
+        memcpy(notify_requester.peer_mac, requester->mac, 6);
+        notify_requester.peer_public = requester->public_addr;
+        send_msg(ctx->udp_fd, &target->public_addr, MSG_PUNCH_NOTIFY, 0, &notify_requester, sizeof(notify_requester));
+    }
 }
 
 void server_handle_reset_punch(struct server_context *ctx, const struct sockaddr_in *src_addr, const struct reset_punch *req) {
-    printf("Reset punch request from "); print_addr(src_addr); printf(" peer=%s\n", req->peer_id);
-    struct server_client *requester = NULL;
-    struct server_client *c = ctx->clients;
-    while (c) {
-        if (c->public_addr.sin_addr.s_addr == src_addr->sin_addr.s_addr &&
-            c->public_addr.sin_port == src_addr->sin_port) { requester = c; break; }
-        c = c->next;
-    }
-    if (!requester) { fprintf(stderr, "Requester not found\n"); return; }
+    printf("Reset punch request from "); print_addr(src_addr); printf(" id=%s peer=%s\n", req->id, req->peer_id);
+    struct server_client *requester = server_find_client(ctx, req->id);
+    if (!requester) { fprintf(stderr, "Requester not found: %s\n", req->id); return; }
+    requester->public_addr = *src_addr;
     struct server_client *target = server_find_client(ctx, req->peer_id);
     if (!target) {
         struct punch_notify zero_notify;
@@ -227,19 +302,45 @@ void server_handle_reset_punch(struct server_context *ctx, const struct sockaddr
         server_send_reset_notify(ctx, requester, req->peer_id, &zero_notify);
         return;
     }
-    struct punch_notify notify_target;
-    strncpy(notify_target.peer_id, target->id, sizeof(notify_target.peer_id) - 1);
-    notify_target.peer_vip = target->vip;
-    memcpy(notify_target.peer_mac, target->mac, 6);
-    notify_target.peer_public = target->public_addr;
-    server_send_reset_notify(ctx, requester, req->peer_id, &notify_target);
 
-    struct punch_notify notify_requester;
-    strncpy(notify_requester.peer_id, requester->id, sizeof(notify_requester.peer_id) - 1);
-    notify_requester.peer_vip = requester->vip;
-    memcpy(notify_requester.peer_mac, requester->mac, 6);
-    notify_requester.peer_public = requester->public_addr;
-    server_send_reset_notify(ctx, target, requester->id, &notify_requester);
+    int use_v2 = (requester->local_addr.sin_addr.s_addr != 0 ||
+                  target->local_addr.sin_addr.s_addr != 0);
+
+    if (use_v2) {
+        struct punch_notify_v2 notify_target;
+        memset(&notify_target, 0, sizeof(notify_target));
+        strncpy(notify_target.peer_id, target->id, sizeof(notify_target.peer_id) - 1);
+        notify_target.peer_vip = target->vip;
+        memcpy(notify_target.peer_mac, target->mac, 6);
+        notify_target.peer_public = target->public_addr;
+        notify_target.peer_local = target->local_addr;
+        server_send_reset_notify_v2(ctx, requester, req->peer_id, &notify_target);
+
+        struct punch_notify_v2 notify_requester;
+        memset(&notify_requester, 0, sizeof(notify_requester));
+        strncpy(notify_requester.peer_id, requester->id, sizeof(notify_requester.peer_id) - 1);
+        notify_requester.peer_vip = requester->vip;
+        memcpy(notify_requester.peer_mac, requester->mac, 6);
+        notify_requester.peer_public = requester->public_addr;
+        notify_requester.peer_local = requester->local_addr;
+        server_send_reset_notify_v2(ctx, target, requester->id, &notify_requester);
+    } else {
+        struct punch_notify notify_target;
+        memset(&notify_target, 0, sizeof(notify_target));
+        strncpy(notify_target.peer_id, target->id, sizeof(notify_target.peer_id) - 1);
+        notify_target.peer_vip = target->vip;
+        memcpy(notify_target.peer_mac, target->mac, 6);
+        notify_target.peer_public = target->public_addr;
+        server_send_reset_notify(ctx, requester, req->peer_id, &notify_target);
+
+        struct punch_notify notify_requester;
+        memset(&notify_requester, 0, sizeof(notify_requester));
+        strncpy(notify_requester.peer_id, requester->id, sizeof(notify_requester.peer_id) - 1);
+        notify_requester.peer_vip = requester->vip;
+        memcpy(notify_requester.peer_mac, requester->mac, 6);
+        notify_requester.peer_public = requester->public_addr;
+        server_send_reset_notify(ctx, target, requester->id, &notify_requester);
+    }
 }
 
 void server_handle_reset_ack(struct server_context *ctx, const struct sockaddr_in *src_addr, const struct msg_header *hdr) {
@@ -249,6 +350,7 @@ void server_handle_reset_ack(struct server_context *ctx, const struct sockaddr_i
 
 void server_send_reset_notify(struct server_context *ctx, struct server_client *client, const char *peer_id, const struct punch_notify *peer_info) {
     struct reset_notify notify;
+    memset(&notify, 0, sizeof(notify));
     notify.notify_seq = htonl(ctx->next_notify_seq++);
     strncpy(notify.peer_id, peer_id, sizeof(notify.peer_id) - 1);
     notify.peer_vip = peer_info->peer_vip;
@@ -258,6 +360,21 @@ void server_send_reset_notify(struct server_context *ctx, struct server_client *
     printf("Sending reset notify to "); print_addr(&client->public_addr);
     printf(" seq=%u\n", ntohl(notify.notify_seq));
     send_msg(ctx->udp_fd, &client->public_addr, MSG_RESET_NOTIFY, 0, &notify, sizeof(notify));
+}
+
+void server_send_reset_notify_v2(struct server_context *ctx, struct server_client *client, const char *peer_id, const struct punch_notify_v2 *peer_info) {
+    struct reset_notify_v2 notify;
+    memset(&notify, 0, sizeof(notify));
+    notify.notify_seq = htonl(ctx->next_notify_seq++);
+    strncpy(notify.peer_id, peer_id, sizeof(notify.peer_id) - 1);
+    notify.peer_vip = peer_info->peer_vip;
+    memcpy(notify.peer_mac, peer_info->peer_mac, 6);
+    notify.peer_new_public = peer_info->peer_public;
+    notify.peer_new_local = peer_info->peer_local;
+    notify.new_session_id = htonl(rand());
+    printf("Sending reset notify V2 to "); print_addr(&client->public_addr);
+    printf(" seq=%u\n", ntohl(notify.notify_seq));
+    send_msg(ctx->udp_fd, &client->public_addr, MSG_RESET_NOTIFY_V2, 0, &notify, sizeof(notify));
 }
 
 void server_check_timeouts(struct server_context *ctx) {

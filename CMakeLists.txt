@@ -30,7 +30,7 @@ endif()
 
 if(WIN32)
     target_link_libraries(p2p_server PRIVATE ws2_32)
-    target_link_libraries(p2p_client PRIVATE ws2_32)
+    target_link_libraries(p2p_client PRIVATE ws2_32 iphlpapi)
     target_compile_definitions(p2p_server PRIVATE _CRT_SECURE_NO_WARNINGS)
     target_compile_definitions(p2p_client PRIVATE _CRT_SECURE_NO_WARNINGS)
 endif()
