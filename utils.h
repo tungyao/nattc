@@ -30,4 +30,10 @@ time_t get_timestamp(void);
 /* Sleep for milliseconds */
 void sleep_ms(int ms);
 
+/* Set UDP socket send/recv buffer sizes, returns actual values (kernel doubles) */
+int set_udp_buf_size(int fd, int desired, int *actual_snd, int *actual_rcv);
+
+/* Get monotonic wall clock in milliseconds (cross-platform) */
+int64_t get_time_ms(void);
+
 #endif /* UTILS_H */

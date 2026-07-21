@@ -18,6 +18,21 @@
 #define PUNCH_REBIND_THRESHOLD 2
 #define TUN_MTU 1400
 
+/* Dynamic UDP buffer sizing */
+#define UDP_BUF_INITIAL         (512 * 1024)
+#define UDP_BUF_MAX             (32 * 1024 * 1024)
+#define UDP_BUF_EAGAIN_THRESHOLD 5
+#define UDP_BUF_CHECK_INTERVAL  5
+#define UDP_BUF_GROW_FACTOR     2
+
+/* Token bucket congestion control */
+#define SEND_RATE_INITIAL_BPS   (50ULL * 1024 * 1024)
+#define SEND_RATE_MIN_BPS       (1ULL * 1024 * 1024)
+#define SEND_RATE_MAX_BPS       (500ULL * 1024 * 1024)
+#define SEND_RATE_LINEAR_INC    (1ULL * 1024 * 1024)
+#define RTT_ESTIMATE_MS         200
+#define SEND_RING_SIZE          64
+
 enum lan_punch_phase {
     LAN_PHASE_NONE = 0,
     LAN_PHASE_LAN,
@@ -32,6 +47,12 @@ struct wintun_ctx {
     void *read_event;
 };
 #endif
+
+struct send_ring_entry {
+    char buf[MAX_MSG_SIZE];
+    uint32_t len;
+    struct sockaddr_in addr;
+};
 
 /* Client context */
 struct client_context {
@@ -50,6 +71,25 @@ struct client_context {
     time_t login_sent_time;
     int login_received;
     int punch_failures;
+
+    /* Dynamic UDP buffer */
+    int udp_buf_size;
+    int eagain_count;
+    time_t last_buf_check;
+    int64_t data_sent_epoch;
+
+    /* Token bucket congestion control */
+    double send_rate;
+    double send_tokens;
+    double max_tokens;
+    int64_t last_token_ms;
+
+    /* Send ring buffer for EAGAIN retry */
+    struct send_ring_entry send_ring[SEND_RING_SIZE];
+    int send_ring_head;
+    int send_ring_tail;
+    int send_ring_count;
+
 #ifdef _WIN32
     struct wintun_ctx wintun;
 #endif
@@ -124,5 +164,9 @@ int is_rfc1918(struct in_addr addr);
 /* UDP socket rebind */
 int client_rebind_udp(struct client_context *ctx);
 void client_resend_login(struct client_context *ctx);
+
+/* Send ring buffer management */
+int  send_ring_enqueue(struct client_context *ctx, const char *data, uint32_t len, const struct sockaddr_in *addr);
+void send_ring_drain(struct client_context *ctx);
 
 #endif /* CLIENT_H */

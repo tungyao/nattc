@@ -13,6 +13,7 @@
 #include <linux/if.h>
 #include <linux/if_tun.h>
 #include <net/route.h>
+#include <sys/time.h>
 #include <ifaddrs.h>
 #else
 #include <winsock2.h>
@@ -115,6 +116,25 @@ int client_init(struct client_context *ctx, const char *server_ip, uint16_t serv
     }
 
     client_discover_local_addr(ctx);
+
+    ctx->udp_buf_size = 0;
+    ctx->eagain_count = 0;
+    ctx->last_buf_check = 0;
+    ctx->data_sent_epoch = 0;
+    ctx->send_rate = (double)SEND_RATE_INITIAL_BPS;
+    ctx->send_tokens = (double)SEND_RATE_INITIAL_BPS * RTT_ESTIMATE_MS / 1000.0;
+    ctx->max_tokens = ctx->send_tokens;
+    ctx->last_token_ms = get_time_ms();
+    memset(ctx->send_ring, 0, sizeof(ctx->send_ring));
+    ctx->send_ring_head = 0;
+    ctx->send_ring_tail = 0;
+    ctx->send_ring_count = 0;
+
+    {   int snd, rcv;
+        set_udp_buf_size(ctx->udp_fd, UDP_BUF_INITIAL, &snd, &rcv);
+        ctx->udp_buf_size = snd;
+        printf("UDP buffer: send=%dKB recv=%dKB\n", snd / 1024, rcv / 1024);
+    }
 
     printf("Client initialized: id=%s vip=%s\n", client_id, virtual_ip);
     return 0;
@@ -577,6 +597,46 @@ void peer_clear_all_mappings(struct client_context *ctx, const char *peer_id, ui
 
 extern volatile int running;
 
+/* ============ Send ring buffer (EAGAIN retry) ============ */
+
+int send_ring_enqueue(struct client_context *ctx, const char *data, uint32_t len, const struct sockaddr_in *addr) {
+    if (ctx->send_ring_count >= SEND_RING_SIZE) {
+        ctx->send_ring_head = (ctx->send_ring_head + 1) % SEND_RING_SIZE;
+        ctx->send_ring_count--;
+    }
+    struct send_ring_entry *entry = &ctx->send_ring[ctx->send_ring_tail];
+    memcpy(entry->buf, data, len);
+    entry->len = len;
+    memcpy(&entry->addr, addr, sizeof(*addr));
+    ctx->send_ring_tail = (ctx->send_ring_tail + 1) % SEND_RING_SIZE;
+    ctx->send_ring_count++;
+    return 0;
+}
+
+void send_ring_drain(struct client_context *ctx) {
+    int drained = 0;
+    while (ctx->send_ring_count > 0 && drained < SEND_RING_SIZE) {
+        struct send_ring_entry *entry = &ctx->send_ring[ctx->send_ring_head];
+        ssize_t sent = sendto(ctx->udp_fd, entry->buf, entry->len, 0,
+                              (const struct sockaddr*)&entry->addr, sizeof(entry->addr));
+        if (sent < 0) {
+            int se = sock_errno();
+            if (se == EAGAIN
+#ifdef _WIN32
+                || se == WSAEWOULDBLOCK
+#else
+                || se == EWOULDBLOCK
+#endif
+               ) {
+                break;
+            }
+        }
+        ctx->send_ring_head = (ctx->send_ring_head + 1) % SEND_RING_SIZE;
+        ctx->send_ring_count--;
+        drained++;
+    }
+}
+
 void client_run(struct client_context *ctx) {
     time_t last_timeout_check = time(NULL);
 
@@ -614,7 +674,7 @@ void client_run(struct client_context *ctx) {
 #ifndef _WIN32
         FD_SET(ctx->tun_fd, &readfds);
         if (ctx->tun_fd > max_fd) max_fd = ctx->tun_fd;
-        tv.tv_sec = 0; tv.tv_usec = 100000;
+        tv.tv_sec = 0; tv.tv_usec = 1000;
 #else
         tv.tv_sec = 0; tv.tv_usec = 50000;
 #endif
@@ -695,7 +755,6 @@ void client_run(struct client_context *ctx) {
                     if (n == -2) break;
                     if (n < 0) break;
                     if (n == 0) break;
-                    printf("TUN recv: %d bytes\n", n);
                     client_process_tun_packet(ctx, buf, (uint32_t)n);
                 }
             }
@@ -731,6 +790,39 @@ void client_run(struct client_context *ctx) {
                 }
                 peer = peer->next;
             }
+
+            /* Drain send ring (retry EAGAIN-failed packets) */
+            send_ring_drain(ctx);
+
+            /* Token bucket rate adaptation + buffer auto-grow */
+            if (ctx->eagain_count > 0) {
+                ctx->send_rate *= 0.5;
+                if (ctx->send_rate < SEND_RATE_MIN_BPS)
+                    ctx->send_rate = SEND_RATE_MIN_BPS;
+
+                if (now - ctx->last_buf_check >= UDP_BUF_CHECK_INTERVAL) {
+                    int target = ctx->udp_buf_size * UDP_BUF_GROW_FACTOR;
+                    if (target > UDP_BUF_MAX) target = UDP_BUF_MAX;
+                    if (target > ctx->udp_buf_size) {
+                        int snd, rcv;
+                        set_udp_buf_size(ctx->udp_fd, target, &snd, &rcv);
+                        int old = ctx->udp_buf_size;
+                        ctx->udp_buf_size = snd;
+                        printf("UDP buffer grown: %dKB -> %dKB (recv=%dKB, ring=%d, rate=%.1f MB/s)\n",
+                               old / 1024, snd / 1024, rcv / 1024, ctx->send_ring_count,
+                               ctx->send_rate / (1024.0 * 1024.0));
+                    }
+                    ctx->last_buf_check = now;
+                }
+            } else if (ctx->data_sent_epoch > 0) {
+                ctx->send_rate += SEND_RATE_LINEAR_INC;
+                if (ctx->send_rate > SEND_RATE_MAX_BPS)
+                    ctx->send_rate = SEND_RATE_MAX_BPS;
+            }
+            ctx->max_tokens = ctx->send_rate * RTT_ESTIMATE_MS / 1000.0;
+            ctx->eagain_count = 0;
+            ctx->data_sent_epoch = 0;
+
             /* Print periodic peer status summary every 5 seconds */
             if (ctx->peers && (now % 5) == 1) {
                 printf("\n========== Peer Status Summary ==========\n");
@@ -1063,9 +1155,6 @@ void client_handle_p2p_data(struct client_context *ctx, const struct sockaddr_in
                             const struct p2p_data_header *hdr, const void *data, uint32_t data_len) {
     uint32_t session_id = ntohl(hdr->session_id);
     uint32_t seq = ntohl(hdr->seq);
-    printf("P2P data: session=%u seq=%u len=%u from ", session_id, seq, data_len);
-    print_addr(src_addr);
-    printf("\n");
 
     struct peer_session *peer = ctx->peers;
     while (peer) {
@@ -1073,11 +1162,8 @@ void client_handle_p2p_data(struct client_context *ctx, const struct sockaddr_in
         peer = peer->next;
     }
     if (!peer) { fprintf(stderr, "P2P data for unknown session %u\n", session_id); return; }
-    if (seq <= peer->rx_seq && peer->rx_seq != 0) {
-        fprintf(stderr, "Out-of-order/duplicate: seq=%u, expected>%u\n", seq, peer->rx_seq);
-        return;
-    }
-    peer->rx_seq = seq;
+    if (seq == peer->rx_seq && peer->rx_seq != 0) return;
+    if (seq > peer->rx_seq) peer->rx_seq = seq;
     peer->last_rx_time = time(NULL);
     if (peer->public_addr.sin_addr.s_addr != src_addr->sin_addr.s_addr ||
         peer->public_addr.sin_port != src_addr->sin_port) {
@@ -1089,8 +1175,6 @@ void client_handle_p2p_data(struct client_context *ctx, const struct sockaddr_in
     int written = tun_write(ctx, data, data_len);
     if (written < 0) {
         fprintf(stderr, "write TUN failed: %s\n", sock_strerror());
-    } else {
-        printf("P2P data: wrote %d bytes to TUN (session=%u)\n", written, session_id);
     }
 }
 
@@ -1213,17 +1297,63 @@ void client_send_p2p_data(struct client_context *ctx, struct peer_session *peer,
         fprintf(stderr, "Cannot send to %s: not established\n", peer->id);
         return;
     }
-    size_t total_len = sizeof(struct p2p_data_header) + len;
-    char *buf = (char*)malloc(total_len);
-    if (!buf) { perror("malloc"); return; }
-    struct p2p_data_header *hdr = (struct p2p_data_header*)buf;
-    hdr->session_id = htonl(peer->session_id);
+
+    uint32_t total = sizeof(struct msg_header) + sizeof(struct p2p_data_header) + len;
+    if (total > MAX_MSG_SIZE) return;
+
+    /* Refill token bucket (sub-millisecond precision) */
+    int64_t now_ms = get_time_ms();
+    if (now_ms > ctx->last_token_ms) {
+        double elapsed = (double)(now_ms - ctx->last_token_ms) / 1000.0;
+        ctx->send_tokens += elapsed * ctx->send_rate;
+        if (ctx->send_tokens > ctx->max_tokens)
+            ctx->send_tokens = ctx->max_tokens;
+    }
+    ctx->last_token_ms = now_ms;
+
+    if ((double)total > ctx->send_tokens) {
+        /* Rate-limited: drop for now, TCP will retransmit */
+        return;
+    }
+
+    struct p2p_data_header hdr;
+    hdr.session_id = htonl(peer->session_id);
     peer->tx_seq++;
-    hdr->seq = htonl(peer->tx_seq);
-    memcpy(buf + sizeof(struct p2p_data_header), data, len);
-    send_msg(ctx->udp_fd, &peer->public_addr, MSG_P2P_DATA, 0, buf, total_len);
+    hdr.seq = htonl(peer->tx_seq);
+
+    char buf[MAX_MSG_SIZE];
+    struct msg_header *mhdr = (struct msg_header*)buf;
+    mhdr->magic = htons(PROTO_MAGIC);
+    mhdr->type = htons(MSG_P2P_DATA);
+    mhdr->seq = 0;
+    mhdr->body_len = htonl(sizeof(hdr) + len);
+    memcpy(buf + sizeof(struct msg_header), &hdr, sizeof(hdr));
+    memcpy(buf + sizeof(struct msg_header) + sizeof(hdr), data, len);
+
+    ssize_t sent = sendto(ctx->udp_fd, buf, total, 0,
+                          (const struct sockaddr*)&peer->public_addr, sizeof(peer->public_addr));
+    if (sent < 0) {
+        int se = sock_errno();
+        if (se == EAGAIN
+#ifdef _WIN32
+            || se == WSAEWOULDBLOCK
+#else
+            || se == EWOULDBLOCK
+#endif
+           ) {
+            ctx->eagain_count++;
+            peer->tx_seq--;
+            send_ring_enqueue(ctx, buf, total, &peer->public_addr);
+            return;
+        }
+        fprintf(stderr, "sendto P2P failed: %s\n", sock_strerror());
+        peer->tx_seq--;
+        return;
+    }
+
+    ctx->send_tokens -= (double)total;
+    ctx->data_sent_epoch += total;
     peer->last_tx_time = time(NULL);
-    free(buf);
 }
 
 void client_process_tun_packet(struct client_context *ctx, const void *packet, uint32_t len) {
@@ -1235,18 +1365,15 @@ void client_process_tun_packet(struct client_context *ctx, const void *packet, u
         memcpy(&dst_ip, pkt + 16, 4);
         char dst_str[INET_ADDRSTRLEN];
         ip_uint32_to_str(dst_ip, dst_str, sizeof(dst_str));
-        printf("TUN: IPv4 proto=%u dst=%s\n", pkt[9], dst_str);
         struct arp_entry *arp = arp_find(ctx, dst_ip);
         if (!arp) {
             if (dst_ip == ctx->vip) {
-                printf("TUN: local VIP packet, writing to TUN\n");
                 tun_write(ctx, packet, len);
                 return;
             }
             fprintf(stderr, "TUN: *** No ARP entry for %s ***\n", dst_str);
             return;
         }
-        printf("TUN: ARP hit peer=%s\n", arp->peer_id);
         struct peer_session *peer = peer_find(ctx, arp->peer_id);
         if (!peer) { fprintf(stderr, "TUN: No peer session for %s\n", arp->peer_id); return; }
         if (peer->state != PEER_STATE_ESTABLISHED) {
@@ -1254,17 +1381,13 @@ void client_process_tun_packet(struct client_context *ctx, const void *packet, u
                     peer->id, peer->state, PEER_STATE_ESTABLISHED);
             return;
         }
-        printf("TUN: Sending %u bytes to peer %s\n", len, peer->id);
         client_send_p2p_data(ctx, peer, packet, len);
         return;
     }
     /* Non-IPv4 packet: check if it looks like an Ethernet frame (TAP mode) with ARP */
     /* Ethernet frames: dstMAC(6)+srcMAC(6)+EtherType(2), ARP EtherType=0x0806 */
     if (len >= 42 && pkt[12] == 0x08 && pkt[13] == 0x06) {
-        printf("TUN: ARP packet detected (EtherType 0x0806), handling via ARP proxy\n");
         client_send_arp_reply(ctx, packet, len);
-    } else {
-        printf("TUN: non-IPv4/non-ARP packet (first byte 0x%02x, len=%u), discarding\n", pkt[0], len);
     }
 }
 

@@ -3,7 +3,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
-
 #ifdef _WIN32
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -17,6 +16,7 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #endif
@@ -29,9 +29,6 @@ int create_udp_socket(void) {
         fprintf(stderr, "WSASocket failed: %d\n", WSAGetLastError());
         return -1;
     }
-    /* Disable WSAECONNRESET (10054) on recvfrom when an ICMP Port Unreachable
-       is received. Without this, UDP hole punching on Windows breaks because
-       recvfrom keeps failing after the first ICMP error. */
     {
         DWORD bytes = 0;
         BOOL disable = FALSE;
@@ -42,6 +39,9 @@ int create_udp_socket(void) {
     fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (fd < 0) { perror("socket"); return -1; }
 #endif
+    int buf_size = 262144;
+    setsockopt(fd, SOL_SOCKET, SO_RCVBUF, (const char*)&buf_size, sizeof(buf_size));
+    setsockopt(fd, SOL_SOCKET, SO_SNDBUF, (const char*)&buf_size, sizeof(buf_size));
     return fd;
 }
 
@@ -62,7 +62,6 @@ int set_nonblocking(int fd) {
 
 int send_msg(int fd, const struct sockaddr_in *addr, uint16_t type, uint32_t seq,
              const void *body, uint32_t body_len) {
-    /* Build flat buffer instead of using sendmsg (not portable) */
     struct msg_header hdr;
     hdr.magic = htons(PROTO_MAGIC);
     hdr.type = htons(type);
@@ -70,8 +69,8 @@ int send_msg(int fd, const struct sockaddr_in *addr, uint16_t type, uint32_t seq
     hdr.body_len = htonl(body_len);
 
     uint32_t total = sizeof(hdr) + body_len;
-    char *buf = (char*)malloc(total);
-    if (!buf) { perror("malloc"); return -1; }
+    char buf[MAX_MSG_SIZE];
+    if (total > sizeof(buf)) return -1;
 
     memcpy(buf, &hdr, sizeof(hdr));
     if (body && body_len > 0)
@@ -79,7 +78,6 @@ int send_msg(int fd, const struct sockaddr_in *addr, uint16_t type, uint32_t seq
 
     ssize_t sent = sendto(fd, buf, total, 0,
                           (const struct sockaddr*)addr, sizeof(*addr));
-    free(buf);
 
     if (sent < 0) {
         fprintf(stderr, "sendto failed: %s\n", sock_strerror());
@@ -199,4 +197,41 @@ void sleep_ms(int ms) {
     ts.tv_nsec = (long)(ms % 1000) * 1000000;
     nanosleep(&ts, NULL);
 #endif
+}
+
+int64_t get_time_ms(void) {
+#ifdef _WIN32
+    return (int64_t)GetTickCount64();
+#else
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return (int64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000;
+#endif
+}
+
+int set_udp_buf_size(int fd, int desired, int *actual_snd, int *actual_rcv) {
+    int tmp;
+    socklen_t optlen;
+
+    if (setsockopt(fd, SOL_SOCKET, SO_SNDBUF, (const char*)&desired, sizeof(desired)) < 0) {
+        fprintf(stderr, "setsockopt SO_SNDBUF(%d) failed: %s\n", desired, sock_strerror());
+    }
+    optlen = sizeof(tmp);
+    if (getsockopt(fd, SOL_SOCKET, SO_SNDBUF, (char*)&tmp, &optlen) == 0) {
+        *actual_snd = tmp;
+    } else {
+        *actual_snd = desired;
+    }
+
+    if (setsockopt(fd, SOL_SOCKET, SO_RCVBUF, (const char*)&desired, sizeof(desired)) < 0) {
+        fprintf(stderr, "setsockopt SO_RCVBUF(%d) failed: %s\n", desired, sock_strerror());
+    }
+    optlen = sizeof(tmp);
+    if (getsockopt(fd, SOL_SOCKET, SO_RCVBUF, (char*)&tmp, &optlen) == 0) {
+        *actual_rcv = tmp;
+    } else {
+        *actual_rcv = desired;
+    }
+
+    return 0;
 }
