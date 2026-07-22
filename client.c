@@ -435,7 +435,19 @@ int tun_del_route(struct client_context *ctx, const char *dst) {
 int tun_write(struct client_context *ctx, const void *data, uint32_t len) {
 #ifndef _WIN32
     ssize_t written = write(ctx->tun_fd, data, len);
-    if (written < 0) { perror("write TUN"); return -1; }
+    if (written < 0) {
+        int e = errno;
+        if (e == EINVAL) {
+            fprintf(stderr, "write TUN EINVAL: fd=%d len=%u first=0x%02x%02x%02x%02x tun_fd=%d state=%d\n",
+                    ctx->tun_fd, len,
+                    ((const uint8_t*)data)[0], ((const uint8_t*)data)[1],
+                    ((const uint8_t*)data)[2], ((const uint8_t*)data)[3],
+                    ctx->tun_fd, fcntl(ctx->tun_fd, F_GETFD));
+        } else {
+            perror("write TUN");
+        }
+        return -1;
+    }
     return (int)written;
 #else
     /* Wintun: allocate and send */
