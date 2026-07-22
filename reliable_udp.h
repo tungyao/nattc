@@ -102,6 +102,7 @@ struct reliable_stream {
   uint32_t send_buf_head;
   uint32_t send_buf_tail;
   uint32_t next_stream_seq_send;
+  uint32_t total_bytes_sent;
 
   /* Receive side */
   uint8_t recv_buf[RELIABLE_STREAM_RECV_BUF_SIZE];
@@ -109,6 +110,7 @@ struct reliable_stream {
   uint32_t recv_buf_tail;
   uint32_t next_stream_seq_recv;
   struct recv_data_node *recv_pending;
+  uint8_t pending_window_update;
 
   /* Flow control */
   struct stream_flow_control flow;

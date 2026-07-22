@@ -955,6 +955,110 @@ static void test_close_with_pending_data(void)
   PASS();
 }
 
+static void test_window_update_max_data(void)
+{
+  TEST("window_update_max_data_correct");
+  struct loopback_ctx lb;
+  struct reliable_conn *conn = setup_conn(&lb, 111);
+
+  struct reliable_stream *s = reliable_stream_open(conn, 1, 1, 0);
+  assert(s != NULL);
+
+  /* Feed data into recv buffer */
+  uint8_t payload[RELIABLE_STREAM_RECV_BUF_SIZE / 2];
+  memset(payload, 'A', sizeof(payload));
+  uint32_t pseq = 1;
+  uint32_t offset = 0;
+  while (offset < sizeof(payload)) {
+    uint32_t chunk = 1000;
+    if (sizeof(payload) - offset < chunk) chunk = sizeof(payload) - offset;
+    uint8_t dgram[MAX_DATAGRAM_SIZE];
+    uint16_t dgram_len;
+    build_data_datagram(dgram, &dgram_len, s->stream_id,
+                         pseq++, (offset / 1000) + 1,
+                         payload + offset, (uint16_t)chunk);
+    reliable_conn_input(conn, dgram, dgram_len, 100 + offset);
+    offset += chunk;
+  }
+
+  /* Clear loopback buffer */
+  memset(&lb, 0, sizeof(lb));
+
+  /* Recv some data to trigger WINDOW_UPDATE */
+  uint8_t recv_buf[4000];
+  int n = reliable_stream_recv(s, recv_buf, sizeof(recv_buf));
+  assert(n > 0);
+
+  /* Verify WINDOW_UPDATE frame was sent with correct max_data */
+  assert(lb.len > 0);
+  int type = frame_peek_type(lb.buf, lb.len);
+  assert(type == FRAME_TYPE_WINDOW_UPDATE);
+
+  /* Parse max_data from WINDOW_UPDATE frame */
+  const uint8_t *wu_frame = lb.buf + FRAME_LENGTH_FIELD_SIZE;
+  uint16_t wu_frame_len = ((uint16_t)lb.buf[0] << 8) | lb.buf[1];
+  (void)wu_frame_len;
+  uint32_t max_data;
+  memcpy(&max_data, wu_frame + FRAME_HEADER_SIZE, 4);
+  max_data = __builtin_bswap32(max_data);
+  assert(max_data == (uint32_t)(s->recv_buf_tail + RELIABLE_STREAM_RECV_BUF_SIZE));
+
+  reliable_conn_destroy(conn);
+  PASS();
+}
+
+static void test_priority_clamping(void)
+{
+  TEST("priority_clamping");
+  struct loopback_ctx lb;
+  struct reliable_conn *conn = setup_conn(&lb, 112);
+
+  struct reliable_stream *s0 = reliable_stream_open(conn, 1, 1, 0);
+  assert(s0 != NULL);
+  assert(s0->priority == 0);
+
+  struct reliable_stream *s3 = reliable_stream_open(conn, 1, 1, 3);
+  assert(s3 != NULL);
+  assert(s3->priority == 3);
+
+  struct reliable_stream *s_high = reliable_stream_open(conn, 1, 1, 5);
+  assert(s_high != NULL);
+  assert(s_high->priority == 3);
+
+  struct reliable_stream *s_max = reliable_stream_open(conn, 1, 1, 255);
+  assert(s_max != NULL);
+  assert(s_max->priority == 3);
+
+  reliable_conn_destroy(conn);
+  PASS();
+}
+
+static void test_total_bytes_sent_flow_control(void)
+{
+  TEST("total_bytes_sent_flow_control");
+  struct loopback_ctx lb;
+  struct reliable_conn *conn = setup_conn(&lb, 113);
+
+  struct reliable_stream *s = reliable_stream_open(conn, 1, 1, 0);
+  assert(s != NULL);
+  assert(s->total_bytes_sent == 0);
+
+  /* Set a tight send window */
+  s->flow.send_window = 200;
+
+  uint8_t big_data[1000];
+  memset(big_data, 'Y', sizeof(big_data));
+  int n = reliable_stream_send(s, big_data, sizeof(big_data));
+  assert(n == 1000);
+
+  reliable_conn_tick(conn, 100);
+  assert(s->total_bytes_sent <= s->flow.send_window);
+  assert(s->total_bytes_sent > 0);
+
+  reliable_conn_destroy(conn);
+  PASS();
+}
+
 /* ------------------------------------------------------------------ */
 /*  main                                                              */
 /* ------------------------------------------------------------------ */
@@ -1001,6 +1105,9 @@ int main(void)
   test_multi_stream_independence();
   test_stream_send_after_close_rejected();
   test_close_with_pending_data();
+  test_window_update_max_data();
+  test_priority_clamping();
+  test_total_bytes_sent_flow_control();
 
   printf("\n=== Results ===\n");
   if (g_failures == 0) {

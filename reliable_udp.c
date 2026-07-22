@@ -3,6 +3,8 @@
 #include <string.h>
 #include <sys/time.h>
 
+#define WINDOW_UPDATE_FREE_RATIO 2
+
 /* ------------------------------------------------------------------ */
 /*  Q16.16 fixed-point helpers                                        */
 /* ------------------------------------------------------------------ */
@@ -46,11 +48,11 @@ static int fb_send(struct frame_builder *fb, struct reliable_conn *conn)
 /* ------------------------------------------------------------------ */
 /*  Helper: build a frame header into a buffer                        */
 /* ------------------------------------------------------------------ */
-static int build_header(uint8_t *buf, uint8_t type, uint16_t stream_id)
+static int build_header(uint8_t *buf, uint8_t type, uint16_t stream_id, uint8_t priority)
 {
   struct frame_header hdr;
   hdr.version = FRAME_VERSION;
-  hdr.priority = 0;
+  hdr.priority = priority;
   hdr.reserved = 0;
   hdr.type = type;
   hdr.stream_id = stream_id;
@@ -355,13 +357,29 @@ static void drain_recv_pending(struct reliable_stream *stream)
   }
 }
 
+/* Free a stream: unlink from list, free recv_pending, free memory */
+static void free_stream(struct reliable_conn *conn, struct reliable_stream *stream)
+{
+  free_recv_pending(stream);
+  inflight_clear_stream(conn, stream->stream_id);
+  struct reliable_stream **pp = &conn->streams;
+  while (*pp) {
+    if (*pp == stream) {
+      *pp = stream->next;
+      break;
+    }
+    pp = &(*pp)->next;
+  }
+  free(stream);
+}
+
 /* ------------------------------------------------------------------ */
 /*  Send an ACK frame immediately                                     */
 /* ------------------------------------------------------------------ */
 static int send_ack_frame(struct reliable_conn *conn, uint32_t now_ms)
 {
   uint8_t ack_buf[MAX_DATAGRAM_SIZE];
-  int hdr_sz = build_header(ack_buf, FRAME_TYPE_ACK, CONNECTION_STREAM_ID);
+  int hdr_sz = build_header(ack_buf, FRAME_TYPE_ACK, CONNECTION_STREAM_ID, 0);
   if (hdr_sz < 0) return -1;
 
   int ack_body_len = ack_tracker_generate(&conn->ack_tx, now_ms,
@@ -522,7 +540,10 @@ static void process_ack_frame(struct reliable_conn *conn,
 
           uint32_t new_seq = conn->next_packet_seq++;
           uint8_t frame[MAX_DATAGRAM_SIZE];
-          build_header(frame, FRAME_TYPE_DATA, e->stream_id);
+          uint8_t retrans_prio = 0;
+          struct reliable_stream *retrans_s = find_stream(conn, e->stream_id);
+          if (retrans_s) retrans_prio = retrans_s->priority;
+          build_header(frame, FRAME_TYPE_DATA, e->stream_id, retrans_prio);
 
           struct frame_data fd;
           fd.packet_seq = new_seq;
@@ -569,9 +590,9 @@ static int send_stream_data(struct reliable_conn *conn,
   if (avail == 0) return 0;
 
   while (avail > 0) {
-    /* Check stream-level flow control */
+    /* Check stream-level flow control (absolute byte offset) */
     if (stream->reliable &&
-        stream->flow.bytes_in_flight >= stream->flow.send_window)
+        stream->total_bytes_sent >= stream->flow.send_window)
       break;
 
     /* Check connection-level flow control */
@@ -580,9 +601,10 @@ static int send_stream_data(struct reliable_conn *conn,
 
     uint32_t chunk_len = avail < MAX_FRAME_BODY ? avail : MAX_FRAME_BODY;
 
-    /* Don't exceed remaining window */
+    /* Don't exceed remaining window (absolute offset limit) */
     if (stream->reliable) {
-      uint32_t stream_rem = stream->flow.send_window - stream->flow.bytes_in_flight;
+      if (stream->total_bytes_sent >= stream->flow.send_window) break;
+      uint32_t stream_rem = stream->flow.send_window - stream->total_bytes_sent;
       if (chunk_len > stream_rem) chunk_len = stream_rem;
     }
     uint32_t conn_rem = conn->conn_send_window - conn->conn_bytes_in_flight;
@@ -593,7 +615,7 @@ static int send_stream_data(struct reliable_conn *conn,
 
     /* Build DATA frame */
     uint8_t frame[MAX_DATAGRAM_SIZE];
-    build_header(frame, FRAME_TYPE_DATA, stream->stream_id);
+    build_header(frame, FRAME_TYPE_DATA, stream->stream_id, stream->priority);
 
     struct frame_data fd;
     fd.packet_seq = packet_seq;
@@ -614,6 +636,7 @@ static int send_stream_data(struct reliable_conn *conn,
              stream->send_buf, chunk_len - first);
     }
 
+    stream->total_bytes_sent += chunk_len;
     stream->send_buf_tail += chunk_len;
     avail -= chunk_len;
 
@@ -670,7 +693,7 @@ static int send_stream_close_frame(struct reliable_stream *stream)
   if (!conn) return -1;
 
   uint8_t frame[MAX_DATAGRAM_SIZE];
-  int hdr_sz = build_header(frame, FRAME_TYPE_STREAM_CLOSE, stream->stream_id);
+  int hdr_sz = build_header(frame, FRAME_TYPE_STREAM_CLOSE, stream->stream_id, 0);
   if (hdr_sz < 0) return -1;
 
   frame_serialize_stream_close_body(frame + FRAME_HEADER_SIZE);
@@ -692,7 +715,7 @@ static int send_window_update_frame(struct reliable_conn *conn,
                                      uint16_t stream_id, uint32_t max_data)
 {
   uint8_t frame[MAX_DATAGRAM_SIZE];
-  int hdr_sz = build_header(frame, FRAME_TYPE_WINDOW_UPDATE, stream_id);
+  int hdr_sz = build_header(frame, FRAME_TYPE_WINDOW_UPDATE, stream_id, 0);
   if (hdr_sz < 0) return -1;
 
   struct frame_window_update wu;
@@ -791,10 +814,14 @@ struct reliable_stream* reliable_stream_open(struct reliable_conn *conn,
     conn->next_responder_stream_id += STREAM_ID_STEP;
   }
 
+  if (priority > 3) priority = 3;
+
   stream->stream_id = sid;
   stream->reliable = reliable;
   stream->ordered = ordered;
   stream->priority = priority;
+  stream->total_bytes_sent = 0;
+  stream->pending_window_update = 0;
   stream->state = STREAM_OPEN;
   stream->sent_close_frame = 0;
   stream->remote_closed = 0;
@@ -836,21 +863,8 @@ void reliable_stream_close(struct reliable_stream *stream)
   int can_close = (stream->send_buf_head == stream->send_buf_tail);
   if (stream->remote_closed || can_close) {
     stream->state = STREAM_CLOSED;
-    free_recv_pending(stream);
-    inflight_clear_stream(conn, stream->stream_id);
-
-    /* Unlink from connection's stream list and free */
-    if (conn) {
-      struct reliable_stream **pp = &conn->streams;
-      while (*pp) {
-        if (*pp == stream) {
-          *pp = stream->next;
-          break;
-        }
-        pp = &(*pp)->next;
-      }
-    }
-    free(stream);
+    if (conn)
+      free_stream(conn, stream);
   }
 }
 
@@ -903,13 +917,11 @@ int reliable_stream_recv(struct reliable_stream *stream,
   if (conn) {
     uint32_t recv_used = stream->recv_buf_head - stream->recv_buf_tail;
     uint32_t recv_free = RELIABLE_STREAM_RECV_BUF_SIZE - recv_used;
-    /* Send update if free space > 50% of buffer and we haven't advertised recently */
-    if (recv_free > RELIABLE_STREAM_RECV_BUF_SIZE / 2) {
-      uint32_t max_data = stream->flow.bytes_received;
-      /* max_data = total bytes the receiver has consumed from recv buffer
-         = recv_buf_tail */
-      send_window_update_frame(conn, stream->stream_id,
-                                stream->recv_buf_head);
+    /* Send update if free space > 50% of buffer */
+    if (recv_free > RELIABLE_STREAM_RECV_BUF_SIZE / WINDOW_UPDATE_FREE_RATIO) {
+      uint32_t max_data = stream->recv_buf_tail + RELIABLE_STREAM_RECV_BUF_SIZE;
+      if (send_window_update_frame(conn, stream->stream_id, max_data) < 0)
+        stream->pending_window_update = 1;
     }
   }
 
@@ -924,6 +936,19 @@ int reliable_conn_tick(struct reliable_conn *conn, uint32_t now_ms)
   fb_init(&fb);
 
   conn->last_tick_ms = now_ms;
+
+  /* 0. Retry any pending WINDOW_UPDATE frames */
+  {
+    struct reliable_stream *wu_s = conn->streams;
+    while (wu_s) {
+      if (wu_s->pending_window_update) {
+        uint32_t max_data = wu_s->recv_buf_tail + RELIABLE_STREAM_RECV_BUF_SIZE;
+        if (send_window_update_frame(conn, wu_s->stream_id, max_data) == 0)
+          wu_s->pending_window_update = 0;
+      }
+      wu_s = wu_s->next;
+    }
+  }
 
   /* 1. Check for retransmission timeouts */
   uint32_t timeout_ms = rtt_compute_timeout_ms(&conn->rtt,
@@ -940,7 +965,10 @@ int reliable_conn_tick(struct reliable_conn *conn, uint32_t now_ms)
 
     uint32_t new_seq = conn->next_packet_seq++;
     uint8_t frame[MAX_DATAGRAM_SIZE];
-    build_header(frame, FRAME_TYPE_DATA, e->stream_id);
+    uint8_t retrans_prio = 0;
+    struct reliable_stream *retrans_s = find_stream(conn, e->stream_id);
+    if (retrans_s) retrans_prio = retrans_s->priority;
+    build_header(frame, FRAME_TYPE_DATA, e->stream_id, retrans_prio);
 
     struct frame_data fd;
     fd.packet_seq = new_seq;
@@ -987,18 +1015,7 @@ int reliable_conn_tick(struct reliable_conn *conn, uint32_t now_ms)
         if (s->send_buf_head == s->send_buf_tail) {
           if (s->remote_closed) {
             s->state = STREAM_CLOSED;
-            free_recv_pending(s);
-            inflight_clear_stream(conn, s->stream_id);
-            /* Unlink and free */
-            struct reliable_stream **pp = &conn->streams;
-            while (*pp) {
-              if (*pp == s) {
-                *pp = s->next;
-                break;
-              }
-              pp = &(*pp)->next;
-            }
-            free(s);
+            free_stream(conn, s);
           }
         }
       }
@@ -1009,7 +1026,7 @@ int reliable_conn_tick(struct reliable_conn *conn, uint32_t now_ms)
   /* 3. Send pending ACK (if no data was sent, send standalone ACK) */
   if (conn->pending_ack) {
     uint8_t ack_buf[MAX_DATAGRAM_SIZE];
-    build_header(ack_buf, FRAME_TYPE_ACK, CONNECTION_STREAM_ID);
+    build_header(ack_buf, FRAME_TYPE_ACK, CONNECTION_STREAM_ID, 0);
 
     int ack_body_len = ack_tracker_generate(&conn->ack_tx, now_ms,
                                              ack_buf + FRAME_HEADER_SIZE,
@@ -1030,7 +1047,7 @@ int reliable_conn_tick(struct reliable_conn *conn, uint32_t now_ms)
   if (!conn->pending_ack && conn->last_ack_send_ms > 0 &&
       now_ms - conn->last_ack_send_ms >= 10) {
     uint8_t ack_buf[MAX_DATAGRAM_SIZE];
-    build_header(ack_buf, FRAME_TYPE_ACK, CONNECTION_STREAM_ID);
+    build_header(ack_buf, FRAME_TYPE_ACK, CONNECTION_STREAM_ID, 0);
 
     int ack_body_len = ack_tracker_generate(&conn->ack_tx, now_ms,
                                              ack_buf + FRAME_HEADER_SIZE,
@@ -1127,17 +1144,7 @@ int reliable_conn_input(struct reliable_conn *conn,
           if (s->state == STREAM_SEND_CLOSED) {
             /* Both sides closed — fully close */
             s->state = STREAM_CLOSED;
-            free_recv_pending(s);
-            inflight_clear_stream(conn, s->stream_id);
-            struct reliable_stream **pp = &conn->streams;
-            while (*pp) {
-              if (*pp == s) {
-                *pp = s->next;
-                break;
-              }
-              pp = &(*pp)->next;
-            }
-            free(s);
+            free_stream(conn, s);
           } else {
             /* Remote closed, we haven't closed yet */
             s->remote_closed = 1;
@@ -1160,7 +1167,7 @@ int reliable_conn_input(struct reliable_conn *conn,
         int body_sz = frame_serialize_pong_body(
           pong_buf + FRAME_HEADER_SIZE, ts);
         if (body_sz > 0) {
-          build_header(pong_buf, FRAME_TYPE_PONG, CONNECTION_STREAM_ID);
+          build_header(pong_buf, FRAME_TYPE_PONG, CONNECTION_STREAM_ID, 0);
           uint16_t pong_len = FRAME_HEADER_SIZE + (uint16_t)body_sz;
           struct frame_builder pong_fb;
           fb_init(&pong_fb);
