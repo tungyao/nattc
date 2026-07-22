@@ -358,23 +358,26 @@ static void drain_recv_pending(struct reliable_stream *stream)
 /* ------------------------------------------------------------------ */
 /*  Send an ACK frame immediately                                     */
 /* ------------------------------------------------------------------ */
-static void send_ack_frame(struct reliable_conn *conn, uint32_t now_ms)
+static int send_ack_frame(struct reliable_conn *conn, uint32_t now_ms)
 {
   uint8_t ack_buf[MAX_DATAGRAM_SIZE];
   int hdr_sz = build_header(ack_buf, FRAME_TYPE_ACK, CONNECTION_STREAM_ID);
-  if (hdr_sz < 0) return;
+  if (hdr_sz < 0) return -1;
 
   int ack_body_len = ack_tracker_generate(&conn->ack_tx, now_ms,
                                            ack_buf + FRAME_HEADER_SIZE,
                                            MAX_DATAGRAM_SIZE - FRAME_HEADER_SIZE);
+  int ret = 0;
   if (ack_body_len > 0) {
     uint16_t ack_total = FRAME_HEADER_SIZE + (uint16_t)ack_body_len;
-    conn->send_fn(conn->send_ctx, ack_buf, ack_total,
-                  (const struct sockaddr *)&conn->peer_addr,
-                  sizeof(conn->peer_addr));
+    struct frame_builder fb;
+    fb_init(&fb);
+    if (fb_add(&fb, ack_buf, ack_total) == 0)
+      ret = fb_send(&fb, conn);
   }
   conn->pending_ack = 0;
   conn->last_ack_send_ms = now_ms;
+  return ret;
 }
 
 /* ------------------------------------------------------------------ */
@@ -408,7 +411,7 @@ static int process_data_frame(struct reliable_conn *conn,
     int ret = insert_recv_pending(stream, data->stream_seq,
                                   payload, data->data_len);
     send_ack_frame(conn, now_ms);
-    return ret;
+    return ret < 0 ? ret : 0;
   }
 
   /* In-order: write to recv buffer directly */
@@ -533,9 +536,12 @@ static void process_ack_frame(struct reliable_conn *conn,
           e->acked = 0;
           e->dup_ack_count = 0;
 
-          conn->send_fn(conn->send_ctx, frame, frame_len,
-                        (const struct sockaddr *)&conn->peer_addr,
-                        sizeof(conn->peer_addr));
+          struct frame_builder rt_fb;
+          fb_init(&rt_fb);
+          if (fb_add(&rt_fb, frame, frame_len) == 0)
+            conn->send_fn(conn->send_ctx, rt_fb.buf, rt_fb.offset,
+                          (const struct sockaddr *)&conn->peer_addr,
+                          sizeof(conn->peer_addr));
         }
       }
     }
@@ -866,10 +872,14 @@ int reliable_conn_tick(struct reliable_conn *conn, uint32_t now_ms)
   }
 
   /* 2. Send pending data from streams */
-  for (struct reliable_stream *s = conn->streams; s; s = s->next) {
-    if (s->state == STREAM_CLOSED) continue;
-    if (send_stream_data(conn, s, &fb, now_ms) != 0)
-      return -1;
+  struct reliable_stream *s = conn->streams;
+  while (s) {
+    struct reliable_stream *next = s->next;
+    if (s->state != STREAM_CLOSED) {
+      if (send_stream_data(conn, s, &fb, now_ms) != 0)
+        return -1;
+    }
+    s = next;
   }
 
   /* 3. Send pending ACK (if no data was sent, send standalone ACK) */
@@ -1023,9 +1033,12 @@ int reliable_conn_input(struct reliable_conn *conn,
         if (body_sz > 0) {
           build_header(pong_buf, FRAME_TYPE_PONG, CONNECTION_STREAM_ID);
           uint16_t pong_len = FRAME_HEADER_SIZE + (uint16_t)body_sz;
-          conn->send_fn(conn->send_ctx, pong_buf, pong_len,
-                        (const struct sockaddr *)&conn->peer_addr,
-                        sizeof(conn->peer_addr));
+          struct frame_builder pong_fb;
+          fb_init(&pong_fb);
+          if (fb_add(&pong_fb, pong_buf, pong_len) == 0)
+            conn->send_fn(conn->send_ctx, pong_fb.buf, pong_fb.offset,
+                          (const struct sockaddr *)&conn->peer_addr,
+                          sizeof(conn->peer_addr));
         }
         break;
       }

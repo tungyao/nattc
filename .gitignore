@@ -1,4 +1,7 @@
 build/
+build_*/
+dist/
+.superpowers/
 *.o
 *.obj
 *.exe
