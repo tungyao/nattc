@@ -7,12 +7,12 @@ uint32_t cbrt_fp(uint32_t x)
   if (y == 0) y = 1;
   for (int i = 0; i < 4; i++) {
     if (y == 0) { y = 1; break; }
-    y = (2 * y + x / (y * y)) / 3;
+    y = (uint32_t)((2 * (uint64_t)y + x / ((uint64_t)y * y)) / 3);
   }
   return y;
 }
 
-void cubic_init(struct cubic_state *cubic, struct delay_monitor *delay)
+void cubic_init(struct cubic_state *cubic, struct delay_monitor *delay, uint32_t initial_rtt_ms)
 {
   cubic->cwnd = CWND_INITIAL;
   cubic->ssthresh = SSTHRESH_INITIAL;
@@ -22,9 +22,9 @@ void cubic_init(struct cubic_state *cubic, struct delay_monitor *delay)
   cubic->cubic_c = CUBIC_C_Q16;
   cubic->in_recovery = 0;
 
-  delay->base_rtt = 200;
+  delay->base_rtt = initial_rtt_ms;
   delay->current_rtt = 0;
-  delay->rtt_threshold = (uint32_t)((uint32_t)(200 * 3 / 2) << 16);
+  delay->rtt_threshold = (uint32_t)((uint32_t)(initial_rtt_ms * 3 / 2) << 16);
   delay->delay_reduced = 0;
   delay->last_delay_reduce = 0;
 }

@@ -27,7 +27,7 @@ struct delay_monitor {
 };
 
 uint32_t cbrt_fp(uint32_t x);
-void cubic_init(struct cubic_state *cubic, struct delay_monitor *delay);
+void cubic_init(struct cubic_state *cubic, struct delay_monitor *delay, uint32_t initial_rtt_ms);
 void cubic_on_loss(struct cubic_state *cubic, uint32_t now_ms);
 
 #endif

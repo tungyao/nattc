@@ -521,11 +521,11 @@ static void handle_acked_packet(struct reliable_conn *conn,
       int64_t w_cubic = ((int64_t)tdk3 * (int64_t)conn->cubic.cubic_c) >> 16;
       w_cubic += (int64_t)conn->cubic.w_max;
       if (w_cubic < 0) w_cubic = 0;
-      conn->cubic.cwnd = (uint32_t)w_cubic;
-      if (conn->cubic.cwnd < CWND_MIN)
-        conn->cubic.cwnd = CWND_MIN;
-      if (conn->cubic.cwnd > conn->cubic.ssthresh)
-        conn->cubic.cwnd = conn->cubic.ssthresh;
+      uint32_t w_cubic_result = (uint32_t)w_cubic;
+      if (w_cubic_result < CWND_MIN)
+        w_cubic_result = CWND_MIN;
+      if (w_cubic_result > conn->cubic.cwnd)
+        conn->cubic.cwnd = w_cubic_result;
     }
   }
 
@@ -1171,7 +1171,7 @@ struct reliable_conn* reliable_conn_create(uint32_t session_id,
   rtt_init(&conn->rtt);
   ack_tracker_init(&conn->ack_tx);
 
-  cubic_init(&conn->cubic, &conn->delay);
+  cubic_init(&conn->cubic, &conn->delay, INITIAL_RTT_MS);
   conn->bytes_acked_since_last_estimate = 0;
   conn->last_bandwidth_estimate_ms = 0;
   conn->delivery_rate = 0;

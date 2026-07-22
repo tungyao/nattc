@@ -1367,7 +1367,7 @@ static void test_cubic_congestion_avoidance(void)
   /* In CA, cwnd may be capped at ssthresh; verify the cubic state is populated */
   assert(conn->cubic.k > 0);
   assert(conn->cubic.cubic_c == 26214);
-  (void)cwnd_before;
+  assert(conn->cubic.cwnd > cwnd_before);
   reliable_conn_destroy(conn);
   PASS();
 }
