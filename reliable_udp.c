@@ -74,8 +74,15 @@ static struct inflight_entry* inflight_lookup(struct reliable_conn *conn,
 static struct inflight_entry* inflight_insert(struct reliable_conn *conn,
                                                uint32_t packet_seq)
 {
-  (void)packet_seq;
-  /* Reuse acked or invalid slots first */
+  /* Try indexed slot first */
+  uint32_t idx = packet_seq % MAX_INFLIGHT;
+  struct inflight_entry *first = &conn->inflight[idx];
+  if (!first->valid || first->acked) {
+    memset(first, 0, sizeof(*first));
+    return first;
+  }
+
+  /* Fallback: reuse acked or invalid slots */
   struct inflight_entry *candidate = NULL;
   uint32_t oldest_time = (uint32_t)-1;
 
@@ -165,10 +172,12 @@ static void ack_tracker_init(struct ack_tracker *at)
 {
   at->base_seq = 0;
   at->max_seq = 0;
+  at->last_received_time = 0;
   memset(at->bitmap, 0, PACKET_HISTORY_SIZE);
 }
 
-static void ack_tracker_received(struct ack_tracker *at, uint32_t seq)
+static void ack_tracker_received(struct ack_tracker *at, uint32_t seq,
+                                  uint32_t now_ms)
 {
   if (seq >= at->base_seq + PACKET_HISTORY_BITS) {
     memset(at->bitmap, 0, PACKET_HISTORY_SIZE);
@@ -181,8 +190,10 @@ static void ack_tracker_received(struct ack_tracker *at, uint32_t seq)
   uint32_t bit_idx = seq - at->base_seq;
   at->bitmap[bit_idx >> 3] |= (uint8_t)(1 << (bit_idx & 7));
 
-  if (seq > at->max_seq)
+  if (seq > at->max_seq) {
     at->max_seq = seq;
+    at->last_received_time = now_ms;
+  }
 }
 
 /* Generate ACK ranges from the tracker.
@@ -190,7 +201,6 @@ static void ack_tracker_received(struct ack_tracker *at, uint32_t seq)
 static int ack_tracker_generate(struct ack_tracker *at, uint32_t now_ms,
                                  uint8_t *ack_body, uint16_t ack_body_cap)
 {
-  (void)now_ms;
   if (at->max_seq == 0)
     return -1;
 
@@ -206,9 +216,16 @@ static int ack_tracker_generate(struct ack_tracker *at, uint32_t now_ms,
     if (s == 0) break;
   }
 
+  /* Compute ack_delay = time since largest acked packet was received */
+  uint16_t ack_delay = 0;
+  if (at->last_received_time > 0 && now_ms > at->last_received_time) {
+    uint32_t d = now_ms - at->last_received_time;
+    ack_delay = d < 65535 ? (uint16_t)d : 65535;
+  }
+
   struct frame_ack ack;
   ack.largest_acked = largest;
-  ack.ack_delay = 0;
+  ack.ack_delay = ack_delay;
   ack.first_ack_range = first_range;
 
   struct ack_range ranges[MAX_ACK_RANGES];
@@ -339,6 +356,28 @@ static void drain_recv_pending(struct reliable_stream *stream)
 }
 
 /* ------------------------------------------------------------------ */
+/*  Send an ACK frame immediately                                     */
+/* ------------------------------------------------------------------ */
+static void send_ack_frame(struct reliable_conn *conn, uint32_t now_ms)
+{
+  uint8_t ack_buf[MAX_DATAGRAM_SIZE];
+  int hdr_sz = build_header(ack_buf, FRAME_TYPE_ACK, CONNECTION_STREAM_ID);
+  if (hdr_sz < 0) return;
+
+  int ack_body_len = ack_tracker_generate(&conn->ack_tx, now_ms,
+                                           ack_buf + FRAME_HEADER_SIZE,
+                                           MAX_DATAGRAM_SIZE - FRAME_HEADER_SIZE);
+  if (ack_body_len > 0) {
+    uint16_t ack_total = FRAME_HEADER_SIZE + (uint16_t)ack_body_len;
+    conn->send_fn(conn->send_ctx, ack_buf, ack_total,
+                  (const struct sockaddr *)&conn->peer_addr,
+                  sizeof(conn->peer_addr));
+  }
+  conn->pending_ack = 0;
+  conn->last_ack_send_ms = now_ms;
+}
+
+/* ------------------------------------------------------------------ */
 /*  Process a received DATA frame                                     */
 /* ------------------------------------------------------------------ */
 static int process_data_frame(struct reliable_conn *conn,
@@ -346,13 +385,12 @@ static int process_data_frame(struct reliable_conn *conn,
                                const struct frame_data *data,
                                const uint8_t *payload, uint32_t now_ms)
 {
-  (void)now_ms;
   struct reliable_stream *stream = find_stream(conn, stream_id);
   if (!stream)
     return -1;
 
   /* Record packet in ACK tracker */
-  ack_tracker_received(&conn->ack_tx, data->packet_seq);
+  ack_tracker_received(&conn->ack_tx, data->packet_seq, now_ms);
 
   stream->flow.bytes_received += data->data_len;
 
@@ -366,9 +404,11 @@ static int process_data_frame(struct reliable_conn *conn,
   }
 
   if (data->stream_seq > stream->next_stream_seq_recv) {
-    /* Out of order - buffer */
-    return insert_recv_pending(stream, data->stream_seq,
-                                payload, data->data_len);
+    /* Out of order - buffer and send immediate ACK */
+    int ret = insert_recv_pending(stream, data->stream_seq,
+                                  payload, data->data_len);
+    send_ack_frame(conn, now_ms);
+    return ret;
   }
 
   /* In-order: write to recv buffer directly */
@@ -411,6 +451,11 @@ static void handle_acked_packet(struct reliable_conn *conn,
     uint32_t sample_ms = now_ms - e->send_time_ms;
     rtt_update(&conn->rtt, sample_ms);
   }
+
+  /* Decrement bytes_in_flight for the stream */
+  struct reliable_stream *s = find_stream(conn, e->stream_id);
+  if (s && s->flow.bytes_in_flight >= e->payload_len)
+    s->flow.bytes_in_flight -= e->payload_len;
 }
 
 static void process_ack_frame(struct reliable_conn *conn,
@@ -420,8 +465,16 @@ static void process_ack_frame(struct reliable_conn *conn,
 {
   uint32_t current = ack->largest_acked;
 
+  /* Build bitmap of acked packets for this ACK */
+  uint8_t acked_bitmap[PACKET_HISTORY_SIZE];
+  memset(acked_bitmap, 0, PACKET_HISTORY_SIZE);
+  uint32_t acked_base = ack->largest_acked;
+
   /* Process first range (consecutive from largest) */
   for (uint16_t i = 0; i < ack->first_ack_range; i++) {
+    uint32_t bit_idx = acked_base - current;
+    if (bit_idx < PACKET_HISTORY_BITS)
+      acked_bitmap[bit_idx >> 3] |= (uint8_t)(1 << (bit_idx & 7));
     handle_acked_packet(conn, current, now_ms);
     if (current == 0) { current = 0; break; }
     current--;
@@ -429,17 +482,63 @@ static void process_ack_frame(struct reliable_conn *conn,
 
   /* Process additional ranges */
   for (uint16_t i = 0; i < ack->range_count; i++) {
-    /* Skip gap (unacked) packets */
     if (current < ranges[i].gap) break;
     current -= ranges[i].gap;
 
-    /* Process run (acked) packets */
     for (uint16_t j = 0; j < ranges[i].length; j++) {
+      uint32_t bit_idx = acked_base - current;
+      if (bit_idx < PACKET_HISTORY_BITS)
+        acked_bitmap[bit_idx >> 3] |= (uint8_t)(1 << (bit_idx & 7));
       handle_acked_packet(conn, current, now_ms);
       if (current == 0) break;
       current--;
     }
     if (current == 0) break;
+  }
+
+  /* Fast retransmit: increment dup_ack_count for unacked packets < largest_acked */
+  if (ack->largest_acked > 0) {
+    for (int i = 0; i < MAX_INFLIGHT; i++) {
+      struct inflight_entry *e = &conn->inflight[i];
+      if (!e->valid || e->acked || !e->reliable) continue;
+      if (e->packet_seq >= ack->largest_acked) continue;
+
+      uint32_t bit_idx = acked_base - e->packet_seq;
+      int is_acked = (bit_idx < PACKET_HISTORY_BITS) &&
+                     (acked_bitmap[bit_idx >> 3] & (uint8_t)(1 << (bit_idx & 7)));
+
+      if (!is_acked) {
+        e->dup_ack_count++;
+        if (e->dup_ack_count >= 3) {
+          /* Fast retransmit */
+          e->retransmits++;
+          conn->packets_lost++;
+          conn->packets_retransmitted++;
+
+          uint32_t new_seq = conn->next_packet_seq++;
+          uint8_t frame[MAX_DATAGRAM_SIZE];
+          build_header(frame, FRAME_TYPE_DATA, e->stream_id);
+
+          struct frame_data fd;
+          fd.packet_seq = new_seq;
+          fd.stream_seq = e->stream_seq;
+          fd.data_len = e->payload_len;
+          int body_off = frame_serialize_data_body(frame + FRAME_HEADER_SIZE, &fd);
+          memcpy(frame + FRAME_HEADER_SIZE + body_off, e->payload, e->payload_len);
+
+          uint16_t frame_len = FRAME_HEADER_SIZE + body_off + e->payload_len;
+
+          e->packet_seq = new_seq;
+          e->send_time_ms = now_ms;
+          e->acked = 0;
+          e->dup_ack_count = 0;
+
+          conn->send_fn(conn->send_ctx, frame, frame_len,
+                        (const struct sockaddr *)&conn->peer_addr,
+                        sizeof(conn->peer_addr));
+        }
+      }
+    }
   }
 
   /* Remove acked entries from inflight table */
@@ -513,12 +612,16 @@ static int send_stream_data(struct reliable_conn *conn,
     conn->packets_sent++;
     conn->bytes_sent += chunk_len;
 
+    /* Track bytes in flight for flow control (reliable streams only) */
+    if (stream->reliable)
+      stream->flow.bytes_in_flight += chunk_len;
+
     /* Add to frame builder (will coalesce with other frames) */
     if (fb_add(fb, frame, frame_len) != 0) {
       /* Datagram full; send what we have, start new builder */
-      fb_send(fb, conn);
+      if (fb_send(fb, conn) < 0) return -1;
       fb_init(fb);
-      fb_add(fb, frame, frame_len);
+      if (fb_add(fb, frame, frame_len) != 0) return -1;
     }
 
     if (!stream->reliable) {
@@ -592,6 +695,12 @@ struct reliable_stream* reliable_stream_open(struct reliable_conn *conn,
 {
   if (!conn) return NULL;
 
+  /* Enforce MAX_STREAMS limit */
+  uint32_t stream_count = 0;
+  for (struct reliable_stream *s = conn->streams; s; s = s->next) {
+    if (++stream_count >= MAX_STREAMS) return NULL;
+  }
+
   struct reliable_stream *stream = (struct reliable_stream *)
     calloc(1, sizeof(struct reliable_stream));
   if (!stream) return NULL;
@@ -637,15 +746,29 @@ void reliable_stream_close(struct reliable_stream *stream)
 
   stream->state = STREAM_SEND_CLOSED;
 
-  if (stream->conn) {
+  struct reliable_conn *conn = stream->conn;
+  if (conn) {
     /* Remove any in-flight entries for this stream */
-    inflight_clear_stream(stream->conn, stream->stream_id);
+    inflight_clear_stream(conn, stream->stream_id);
   }
 
   /* If no pending data, close fully */
   if (stream->send_buf_head == stream->send_buf_tail) {
     stream->state = STREAM_CLOSED;
     free_recv_pending(stream);
+
+    /* Unlink from connection's stream list and free */
+    if (conn) {
+      struct reliable_stream **pp = &conn->streams;
+      while (*pp) {
+        if (*pp == stream) {
+          *pp = stream->next;
+          break;
+        }
+        pp = &(*pp)->next;
+      }
+    }
+    free(stream);
   }
 }
 
@@ -695,9 +818,9 @@ int reliable_stream_recv(struct reliable_stream *stream,
   return (int)to_copy;
 }
 
-void reliable_conn_tick(struct reliable_conn *conn, uint32_t now_ms)
+int reliable_conn_tick(struct reliable_conn *conn, uint32_t now_ms)
 {
-  if (!conn) return;
+  if (!conn) return -1;
 
   struct frame_builder fb;
   fb_init(&fb);
@@ -736,18 +859,17 @@ void reliable_conn_tick(struct reliable_conn *conn, uint32_t now_ms)
     e->acked = 0;
 
     if (fb_add(&fb, frame, frame_len) != 0) {
-      fb_send(&fb, conn);
+      if (fb_send(&fb, conn) < 0) return -1;
       fb_init(&fb);
-      fb_add(&fb, frame, frame_len);
+      if (fb_add(&fb, frame, frame_len) != 0) return -1;
     }
   }
 
   /* 2. Send pending data from streams */
-  uint32_t stream_count = 0;
   for (struct reliable_stream *s = conn->streams; s; s = s->next) {
-    (void)stream_count;
     if (s->state == STREAM_CLOSED) continue;
-    send_stream_data(conn, s, &fb, now_ms);
+    if (send_stream_data(conn, s, &fb, now_ms) != 0)
+      return -1;
   }
 
   /* 3. Send pending ACK (if no data was sent, send standalone ACK) */
@@ -761,16 +883,37 @@ void reliable_conn_tick(struct reliable_conn *conn, uint32_t now_ms)
     if (ack_body_len > 0) {
       uint16_t ack_total = FRAME_HEADER_SIZE + (uint16_t)ack_body_len;
       if (fb_add(&fb, ack_buf, ack_total) != 0) {
-        fb_send(&fb, conn);
+        if (fb_send(&fb, conn) < 0) return -1;
         fb_init(&fb);
-        fb_add(&fb, ack_buf, ack_total);
+        if (fb_add(&fb, ack_buf, ack_total) != 0) return -1;
       }
     }
     conn->pending_ack = 0;
+    conn->last_ack_send_ms = now_ms;
   }
 
-  /* 4. Flush any remaining frames */
-  fb_send(&fb, conn);
+  /* 4. Timer-based ACK generation (every 10ms if no data flowing) */
+  if (!conn->pending_ack && conn->last_ack_send_ms > 0 &&
+      now_ms - conn->last_ack_send_ms >= 10) {
+    uint8_t ack_buf[MAX_DATAGRAM_SIZE];
+    build_header(ack_buf, FRAME_TYPE_ACK, CONNECTION_STREAM_ID);
+
+    int ack_body_len = ack_tracker_generate(&conn->ack_tx, now_ms,
+                                             ack_buf + FRAME_HEADER_SIZE,
+                                             MAX_DATAGRAM_SIZE - FRAME_HEADER_SIZE);
+    if (ack_body_len > 0) {
+      uint16_t ack_total = FRAME_HEADER_SIZE + (uint16_t)ack_body_len;
+      if (fb_add(&fb, ack_buf, ack_total) != 0) {
+        if (fb_send(&fb, conn) < 0) return -1;
+        fb_init(&fb);
+        if (fb_add(&fb, ack_buf, ack_total) < 0) return -1;
+      }
+      conn->last_ack_send_ms = now_ms;
+    }
+  }
+
+  /* 5. Flush any remaining frames */
+  return fb_send(&fb, conn);
 }
 
 int reliable_conn_input(struct reliable_conn *conn,
@@ -795,6 +938,9 @@ int reliable_conn_input(struct reliable_conn *conn,
       return -1;
 
     if (hdr.version != FRAME_VERSION) continue;
+
+    conn->packets_received++;
+    conn->bytes_received += frame_len;
 
     switch (hdr.type) {
       case FRAME_TYPE_DATA: {
@@ -847,6 +993,16 @@ int reliable_conn_input(struct reliable_conn *conn,
           s->state = STREAM_CLOSED;
           free_recv_pending(s);
           inflight_clear_stream(conn, s->stream_id);
+          /* Unlink and free */
+          struct reliable_stream **pp = &conn->streams;
+          while (*pp) {
+            if (*pp == s) {
+              *pp = s->next;
+              break;
+            }
+            pp = &(*pp)->next;
+          }
+          free(s);
         }
         break;
       }
@@ -876,6 +1032,19 @@ int reliable_conn_input(struct reliable_conn *conn,
 
       case FRAME_TYPE_PONG: {
         /* RTT measurement from PING timestamp */
+        if (frame_len >= FRAME_HEADER_SIZE + 8) {
+          const uint8_t *tb = frame + FRAME_HEADER_SIZE;
+          uint64_t ts = ((uint64_t)tb[0] << 56) | ((uint64_t)tb[1] << 48)
+                       | ((uint64_t)tb[2] << 40) | ((uint64_t)tb[3] << 32)
+                       | ((uint64_t)tb[4] << 24) | ((uint64_t)tb[5] << 16)
+                       | ((uint64_t)tb[6] << 8)  | tb[7];
+          /* Clamp to uint32_t for comparison with now_ms */
+          uint32_t ts32 = (uint32_t)(ts & 0xFFFFFFFF);
+          if (now_ms >= ts32) {
+            uint32_t sample_ms = now_ms - ts32;
+            rtt_update(&conn->rtt, sample_ms);
+          }
+        }
         break;
       }
 

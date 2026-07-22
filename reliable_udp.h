@@ -58,10 +58,11 @@ struct rtt_estimator {
 struct inflight_entry {
   uint32_t packet_seq;
   uint32_t stream_seq;
-  uint16_t payload_len;
   uint32_t send_time_ms;
+  uint16_t payload_len;
   uint16_t retransmits;
-  uint8_t stream_id;
+  uint16_t stream_id;
+  uint16_t dup_ack_count;
   uint8_t reliable;
   uint8_t valid;
   uint8_t acked;
@@ -72,6 +73,7 @@ struct inflight_entry {
 struct ack_tracker {
   uint32_t base_seq;
   uint32_t max_seq;
+  uint32_t last_received_time;
   uint8_t bitmap[PACKET_HISTORY_SIZE];
 };
 
@@ -199,7 +201,7 @@ int reliable_stream_recv(struct reliable_stream *stream,
                           void *buf, uint32_t buf_len);
 
 /* Periodic tick: send pending data, process timeouts, send ACKs */
-void reliable_conn_tick(struct reliable_conn *conn, uint32_t now_ms);
+int reliable_conn_tick(struct reliable_conn *conn, uint32_t now_ms);
 
 /* Process an incoming datagram */
 int reliable_conn_input(struct reliable_conn *conn,
