@@ -764,8 +764,17 @@ void client_run(struct client_context *ctx) {
                         if (rp->rconn &&
                             rp->public_addr.sin_addr.s_addr == src_addr.sin_addr.s_addr &&
                             rp->public_addr.sin_port == src_addr.sin_port) {
+                            if (n >= 2) {
+                                uint16_t magic = ((uint16_t)(uint8_t)buf[0] << 8) | (uint8_t)buf[1];
+                                if (magic == PROTO_MAGIC) {
+                                    client_handle_message(ctx, &src_addr, buf, (size_t)n);
+                                    handled = 1;
+                                    break;
+                                }
+                            }
                             uint32_t now_ms = reliable_time_ms();
                             reliable_conn_input(rp->rconn, buf, (uint32_t)n, now_ms);
+                            rp->last_rx_time = time(NULL);
                             struct reliable_stream *s = rp->rconn->streams;
                             while (s) {
                                 uint8_t rbuf[RELIABLE_STREAM_RECV_BUF_SIZE];
