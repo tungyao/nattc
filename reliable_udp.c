@@ -724,7 +724,7 @@ static int fec_send_parity(struct reliable_conn *conn,
 
   uint16_t padded_len = fec_padded_length(conn->fec_send.packets, conn->fec_n);
   if (padded_len == 0) return 0;
-  uint16_t max_padded = MAX_DATAGRAM_SIZE - FRAME_HEADER_SIZE - FRAME_FEC_BODY_SIZE;
+  uint16_t max_padded = MAX_DATAGRAM_SIZE - FRAME_HEADER_SIZE - FRAME_FEC_BODY_SIZE - conn->fec_n * 2;
   if (padded_len > max_padded) padded_len = max_padded;
 
   struct fec_packet parity[FEC_MAX_M];
