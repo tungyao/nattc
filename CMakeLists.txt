@@ -37,4 +37,15 @@ if(WIN32)
     target_compile_definitions(p2p_client PRIVATE _CRT_SECURE_NO_WARNINGS)
 endif()
 
+# Test for reliable_udp
+add_executable(test_reliable_udp
+    test_reliable_udp.c
+    reliable_udp.c
+    frame.c
+)
+target_compile_definitions(test_reliable_udp PRIVATE _GNU_SOURCE)
+if(UNIX AND NOT APPLE)
+    target_link_libraries(test_reliable_udp PRIVATE rt)
+endif()
+
 install(TARGETS p2p_server p2p_client DESTINATION bin)

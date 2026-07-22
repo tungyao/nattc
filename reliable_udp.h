@@ -92,6 +92,8 @@ struct reliable_stream {
   uint8_t ordered;
   uint8_t priority;
   enum stream_state state;
+  uint8_t sent_close_frame;
+  uint8_t remote_closed;
 
   struct reliable_conn *conn;
 
@@ -146,6 +148,10 @@ struct reliable_conn {
   uint16_t next_initiator_stream_id;
   uint16_t next_responder_stream_id;
   int is_initiator;
+
+  /* Connection-level flow control */
+  uint32_t conn_bytes_in_flight;
+  uint32_t conn_send_window;
 
   /* Stats for congestion (minimal for now) */
   uint32_t bytes_sent;
