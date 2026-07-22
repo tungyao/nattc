@@ -4,6 +4,7 @@
 #include <assert.h>
 
 #include "frame.h"
+#include "fec.h"
 #include "reliable_udp.h"
 
 /* Internal function from reliable_udp.c — exposed for testing */
@@ -269,7 +270,7 @@ static void test_rtt_estimation(void)
   assert(lb.len > 0);
   uint8_t dgram[MAX_DATAGRAM_SIZE];
   uint16_t dgram_len;
-  build_ack_datagram(dgram, &dgram_len, 1, 1);
+  build_ack_datagram(dgram, &dgram_len, 0, 1);
   reliable_conn_input(conn, dgram, dgram_len, 200);
   uint32_t rtt = reliable_conn_get_smoothed_rtt_ms(conn);
   assert(rtt > 50 && rtt < 200);
@@ -354,7 +355,7 @@ static void test_bytes_in_flight(void)
   assert(s->flow.bytes_in_flight == 7);
   uint8_t dgram[MAX_DATAGRAM_SIZE];
   uint16_t dgram_len;
-  build_ack_datagram(dgram, &dgram_len, 1, 1);
+  build_ack_datagram(dgram, &dgram_len, 0, 1);
   reliable_conn_input(conn, dgram, dgram_len, 200);
   assert(s->flow.bytes_in_flight == 0);
   reliable_conn_destroy(conn);
@@ -504,7 +505,7 @@ static void test_fast_retransmit(void)
   reliable_stream_send(s2, "BBBB", 4);
   reliable_conn_tick(conn, 100);
   assert(conn->packets_sent == 2);
-  uint32_t seq2 = 2;
+  uint32_t seq2 = 1;
   for (int dup = 0; dup < 3; dup++) {
     uint8_t dgram[MAX_DATAGRAM_SIZE];
     uint16_t dgram_len;
@@ -525,9 +526,9 @@ static void test_inflight_insert_by_seq(void)
   struct reliable_stream *s = reliable_stream_open(conn, 1, 1, 0);
   reliable_stream_send(s, "test", 4);
   reliable_conn_tick(conn, 100);
-  struct inflight_entry *e = &conn->inflight[1 % MAX_INFLIGHT];
+  struct inflight_entry *e = &conn->inflight[0 % MAX_INFLIGHT];
   assert(e->valid);
-  assert(e->packet_seq == 1);
+  assert(e->packet_seq == 0);
   (void)e;
   reliable_conn_destroy(conn);
   PASS();
@@ -627,8 +628,8 @@ static void test_connection_flow_control(void)
   assert(conn->conn_bytes_in_flight > 0);
 
   /* ACK the sent data to free up window */
-  uint32_t sent_seq = 1;
-  while (conn->conn_bytes_in_flight > 0 && sent_seq <= conn->packets_sent) {
+  uint32_t sent_seq = 0;
+  while (conn->conn_bytes_in_flight > 0 && sent_seq < conn->packets_sent) {
     uint8_t dgram[MAX_DATAGRAM_SIZE];
     uint16_t dgram_len;
     build_ack_datagram(dgram, &dgram_len, sent_seq, 1);
@@ -924,7 +925,7 @@ static void test_close_with_pending_data(void)
 
   /* ACK all sent packets so data is considered delivered */
   uint32_t pseq;
-  for (pseq = 1; pseq <= conn->packets_sent; pseq++) {
+  for (pseq = 0; pseq < conn->packets_sent; pseq++) {
     uint8_t dgram[MAX_DATAGRAM_SIZE];
     uint16_t dgram_len;
     build_ack_datagram(dgram, &dgram_len, pseq, 1);
@@ -1060,6 +1061,219 @@ static void test_total_bytes_sent_flow_control(void)
 }
 
 /* ------------------------------------------------------------------ */
+/*  Phase 3: FEC Tests                                                */
+/* ------------------------------------------------------------------ */
+
+static void test_fec_frame_serialize(void)
+{
+  TEST("fec_frame_serialize");
+  uint8_t buf[FRAME_FEC_BODY_SIZE];
+  struct frame_fec fec = {0xDEADBEEF, 12, 1000};
+  int n = frame_serialize_fec_body(buf, &fec);
+  assert(n == FRAME_FEC_BODY_SIZE);
+  struct frame_fec fec2;
+  frame_deserialize_fec_body(&fec2, buf);
+  assert(fec2.group_id == 0xDEADBEEF);
+  assert(fec2.fec_index == 12);
+  assert(fec2.data_len == 1000);
+  PASS();
+}
+
+static void test_fec_group_derivation(void)
+{
+  TEST("fec_group_derivation");
+  uint8_t n = 10;
+  /* Group ID = packet_seq / n, Index = packet_seq % n */
+  assert(0 / n == 0); assert(0 % n == 0);
+  assert(9 / n == 0); assert(9 % n == 9);
+  assert(10 / n == 1); assert(10 % n == 0);
+  assert(19 / n == 1); assert(19 % n == 9);
+  assert(20 / n == 2); assert(20 % n == 0);
+  PASS();
+}
+
+static void test_fec_encode_decode(void)
+{
+  TEST("fec_encode_decode");
+  struct fec_ctx ctx;
+  fec_init(&ctx, 4, 2);
+
+  struct fec_packet data[4];
+  struct fec_packet parity[2];
+  memset(data, 0, sizeof(data));
+  memset(parity, 0, sizeof(parity));
+
+  for (uint8_t i = 0; i < 4; i++) {
+    for (uint16_t j = 0; j < 100; j++)
+      data[i].data[j] = (uint8_t)(i * 100 + j);
+    data[i].len = 100;
+  }
+
+  uint16_t plen = fec_padded_length(data, 4);
+  assert(plen == 100);
+
+  int ret = fec_encode(&ctx, data, parity, plen);
+  assert(ret == 0);
+
+  /* Zero out packet 1 (simulate loss) */
+  struct fec_packet decode_packets[6];
+  for (uint8_t i = 0; i < 6; i++) {
+    if (i == 1) {
+      memset(&decode_packets[i], 0, sizeof(decode_packets[i]));
+    } else if (i < 4) {
+      memcpy(&decode_packets[i], &data[i], sizeof(data[i]));
+    } else {
+      memcpy(&decode_packets[i], &parity[i - 4], sizeof(parity[i - 4]));
+    }
+  }
+
+  uint8_t missing[] = {1};
+  ret = fec_decode(&ctx, decode_packets, missing, 1, plen);
+  assert(ret == 0);
+
+  /* Verify recovered packet 1 matches original */
+  for (uint16_t j = 0; j < 100; j++)
+    assert(decode_packets[1].data[j] == data[1].data[j]);
+
+  fec_free(&ctx);
+  PASS();
+}
+
+static void test_fec_missing_two(void)
+{
+  TEST("fec_missing_two");
+  struct fec_ctx ctx;
+  fec_init(&ctx, 4, 2);
+
+  struct fec_packet data[4];
+  struct fec_packet parity[2];
+  memset(data, 0, sizeof(data));
+  memset(parity, 0, sizeof(parity));
+
+  for (uint8_t i = 0; i < 4; i++) {
+    for (uint16_t j = 0; j < 50; j++)
+      data[i].data[j] = (uint8_t)(i * 50 + j);
+    data[i].len = 50;
+  }
+
+  uint16_t plen = fec_padded_length(data, 4);
+  fec_encode(&ctx, data, parity, plen);
+
+  /* Zero out packets 0 and 3 (simulate two losses) */
+  struct fec_packet decode_packets[6];
+  for (uint8_t i = 0; i < 6; i++) {
+    if (i == 0 || i == 3) {
+      memset(&decode_packets[i], 0, sizeof(decode_packets[i]));
+    } else if (i < 4) {
+      memcpy(&decode_packets[i], &data[i], sizeof(data[i]));
+    } else {
+      memcpy(&decode_packets[i], &parity[i - 4], sizeof(parity[i - 4]));
+    }
+  }
+
+  uint8_t missing[] = {0, 3};
+  int ret = fec_decode(&ctx, decode_packets, missing, 2, plen);
+  assert(ret == 0);
+
+  for (uint16_t j = 0; j < 50; j++) {
+    assert(decode_packets[0].data[j] == data[0].data[j]);
+    assert(decode_packets[3].data[j] == data[3].data[j]);
+  }
+
+  fec_free(&ctx);
+  PASS();
+}
+
+static void test_fec_no_loss(void)
+{
+  TEST("fec_no_loss");
+  struct fec_ctx ctx;
+  fec_init(&ctx, 4, 2);
+
+  struct fec_packet data[4];
+  struct fec_packet parity[2];
+  memset(data, 0, sizeof(data));
+  memset(parity, 0, sizeof(parity));
+
+  for (uint8_t i = 0; i < 4; i++) {
+    for (uint16_t j = 0; j < 30; j++)
+      data[i].data[j] = (uint8_t)(i * 30 + j);
+    data[i].len = 30;
+  }
+
+  uint16_t plen = fec_padded_length(data, 4);
+  fec_encode(&ctx, data, parity, plen);
+
+  /* All data present, indices 0-3 received, no missing */
+  struct fec_packet decode_packets[4];
+  for (uint8_t i = 0; i < 4; i++)
+    memcpy(&decode_packets[i], &data[i], sizeof(data[i]));
+
+  /* With no missing packets, we can just pass empty missing array */
+  uint8_t missing[] = {};
+  int ret = fec_decode(&ctx, decode_packets, missing, 0, plen);
+  assert(ret == 0);
+
+  for (uint16_t j = 0; j < 30; j++)
+    assert(decode_packets[0].data[j] == data[0].data[j]);
+
+  fec_free(&ctx);
+  PASS();
+}
+
+static void test_fec_too_many_losses(void)
+{
+  TEST("fec_too_many_losses");
+  struct fec_ctx ctx;
+  fec_init(&ctx, 4, 2);
+
+  struct fec_packet data[4];
+  struct fec_packet parity[2];
+  memset(data, 0, sizeof(data));
+  memset(parity, 0, sizeof(parity));
+
+  for (uint8_t i = 0; i < 4; i++) {
+    for (uint16_t j = 0; j < 20; j++)
+      data[i].data[j] = (uint8_t)(i * 20 + j);
+    data[i].len = 20;
+  }
+
+  uint16_t plen = fec_padded_length(data, 4);
+  fec_encode(&ctx, data, parity, plen);
+
+  /* Zero out 3 packets but only M=2 parity - too many losses */
+  struct fec_packet decode_packets[6];
+  for (uint8_t i = 0; i < 6; i++) {
+    if (i < 3) {
+      memset(&decode_packets[i], 0, sizeof(decode_packets[i]));
+    } else if (i < 4) {
+      memcpy(&decode_packets[i], &data[i], sizeof(data[i]));
+    } else {
+      memcpy(&decode_packets[i], &parity[i - 4], sizeof(parity[i - 4]));
+    }
+  }
+
+  uint8_t missing[] = {0, 1, 2};
+  int ret = fec_decode(&ctx, decode_packets, missing, 3, plen);
+  assert(ret == -1);
+
+  fec_free(&ctx);
+  PASS();
+}
+
+static void test_fec_adaptive(void)
+{
+  TEST("fec_adaptive");
+  assert(fec_adaptive_m(0.0f) == 1);
+  assert(fec_adaptive_m(0.005f) == 1);
+  assert(fec_adaptive_m(0.01f) == 2);
+  assert(fec_adaptive_m(0.03f) == 2);
+  assert(fec_adaptive_m(0.05f) == 3);
+  assert(fec_adaptive_m(0.1f) == 3);
+  PASS();
+}
+
+/* ------------------------------------------------------------------ */
 /*  main                                                              */
 /* ------------------------------------------------------------------ */
 int main(void)
@@ -1108,6 +1322,15 @@ int main(void)
   test_window_update_max_data();
   test_priority_clamping();
   test_total_bytes_sent_flow_control();
+
+  printf("\n=== Phase 3: FEC Tests ===\n");
+  test_fec_frame_serialize();
+  test_fec_group_derivation();
+  test_fec_encode_decode();
+  test_fec_missing_two();
+  test_fec_no_loss();
+  test_fec_too_many_losses();
+  test_fec_adaptive();
 
   printf("\n=== Results ===\n");
   if (g_failures == 0) {

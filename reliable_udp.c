@@ -1,4 +1,5 @@
 #include "reliable_udp.h"
+#include "fec.h"
 #include <stdlib.h>
 #include <string.h>
 #include <sys/time.h>
@@ -175,6 +176,7 @@ static void ack_tracker_init(struct ack_tracker *at)
   at->base_seq = 0;
   at->max_seq = 0;
   at->last_received_time = 0;
+  at->received_count = 0;
   memset(at->bitmap, 0, PACKET_HISTORY_SIZE);
 }
 
@@ -192,10 +194,11 @@ static void ack_tracker_received(struct ack_tracker *at, uint32_t seq,
   uint32_t bit_idx = seq - at->base_seq;
   at->bitmap[bit_idx >> 3] |= (uint8_t)(1 << (bit_idx & 7));
 
-  if (seq > at->max_seq) {
+  if (at->received_count == 0 || seq > at->max_seq) {
     at->max_seq = seq;
     at->last_received_time = now_ms;
   }
+  at->received_count++;
 }
 
 /* Generate ACK ranges from the tracker.
@@ -203,7 +206,7 @@ static void ack_tracker_received(struct ack_tracker *at, uint32_t seq,
 static int ack_tracker_generate(struct ack_tracker *at, uint32_t now_ms,
                                  uint8_t *ack_body, uint16_t ack_body_cap)
 {
-  if (at->max_seq == 0)
+  if (at->received_count == 0)
     return -1;
 
   uint32_t largest = at->max_seq;
@@ -232,6 +235,14 @@ static int ack_tracker_generate(struct ack_tracker *at, uint32_t now_ms,
 
   struct ack_range ranges[MAX_ACK_RANGES];
   int range_count = 0;
+
+  if (first_range > largest) {
+    /* All packets from 0 to largest are received — no ranges needed */
+    ack.range_count = 0;
+    int ret = frame_serialize_ack_body(ack_body, &ack, NULL);
+    if (ret < 0 || (uint16_t)ret > ack_body_cap) return -1;
+    return ret;
+  }
 
   /* Walk backward from end of first range */
   uint32_t current = largest - first_range;
@@ -398,6 +409,15 @@ static int send_ack_frame(struct reliable_conn *conn, uint32_t now_ms)
   return ret;
 }
 
+/* Forward declarations for FEC helpers (defined below) */
+static int fec_track_recv_packet(struct reliable_conn *conn,
+                                  uint32_t packet_seq,
+                                  uint16_t stream_id,
+                                  uint32_t stream_seq,
+                                  const uint8_t *payload,
+                                  uint16_t payload_len);
+static int fec_try_decode(struct reliable_conn *conn);
+
 /* ------------------------------------------------------------------ */
 /*  Process a received DATA frame                                     */
 /* ------------------------------------------------------------------ */
@@ -432,6 +452,10 @@ static int process_data_frame(struct reliable_conn *conn,
     return ret < 0 ? ret : 0;
   }
 
+  /* FEC: track received data packet for forward error correction */
+  fec_track_recv_packet(conn, data->packet_seq, stream_id,
+                         data->stream_seq, payload, data->data_len);
+
   /* In-order: write to recv buffer directly */
   uint32_t space = RELIABLE_STREAM_RECV_BUF_SIZE
                  - (stream->recv_buf_head - stream->recv_buf_tail);
@@ -452,6 +476,9 @@ static int process_data_frame(struct reliable_conn *conn,
 
   /* Try to drain pending */
   drain_recv_pending(stream);
+
+  /* Try FEC decode now that we have a new data packet */
+  fec_try_decode(conn);
 
   return 0;
 }
@@ -537,6 +564,7 @@ static void process_ack_frame(struct reliable_conn *conn,
           e->retransmits++;
           conn->packets_lost++;
           conn->packets_retransmitted++;
+          conn->fec_loss_counter++;
 
           uint32_t new_seq = conn->next_packet_seq++;
           uint8_t frame[MAX_DATAGRAM_SIZE];
@@ -576,6 +604,308 @@ static void process_ack_frame(struct reliable_conn *conn,
     if (e->valid && e->acked)
       e->valid = 0;
   }
+}
+
+/* ------------------------------------------------------------------ */
+/*  FEC helpers                                                       */
+/* ------------------------------------------------------------------ */
+
+/* Compute group_id for a packet_seq given fec_n */
+static uint32_t fec_group_id(uint32_t packet_seq, uint8_t fec_n)
+{
+  if (fec_n == 0) return 0;
+  return packet_seq / fec_n;
+}
+
+/* Compute fec_index for a packet_seq given fec_n */
+static uint8_t fec_index_from_seq(uint32_t packet_seq, uint8_t fec_n)
+{
+  if (fec_n == 0) return 0;
+  return (uint8_t)(packet_seq % fec_n);
+}
+
+/* Track a sent DATA packet in the FEC send group.
+ * Returns 1 if group is complete and FEC frames should be sent, 0 otherwise. */
+static int fec_track_sent_packet(struct reliable_conn *conn,
+                                  uint32_t packet_seq,
+                                  uint16_t stream_id,
+                                  uint32_t stream_seq,
+                                  const uint8_t *payload,
+                                  uint16_t payload_len)
+{
+  if (!conn->fec_enabled || conn->fec_n == 0) return 0;
+
+  uint8_t idx = conn->fec_send.count;
+  conn->fec_send.packet_seqs[idx] = packet_seq;
+  conn->fec_send.stream_ids[idx] = stream_id;
+  conn->fec_send.stream_seqs[idx] = stream_seq;
+  conn->fec_send.data_lengths[idx] = payload_len;
+  conn->fec_send.packets[idx].len = payload_len;
+  if (payload_len > 0)
+    memcpy(conn->fec_send.packets[idx].data, payload, payload_len);
+  conn->fec_send.count++;
+
+  if (conn->fec_send.count >= conn->fec_n) {
+    conn->fec_send.group_id = fec_group_id(packet_seq, conn->fec_n);
+    conn->fec_send.count = 0;
+    return 1;
+  }
+  return 0;
+}
+
+/* Encode and send FEC frames for the completed send group */
+static int fec_send_parity(struct reliable_conn *conn,
+                            struct frame_builder *fb,
+                            uint32_t now_ms)
+{
+  struct fec_ctx ctx;
+  fec_init(&ctx, conn->fec_n, conn->fec_m);
+
+  uint16_t padded_len = fec_padded_length(conn->fec_send.packets, conn->fec_n);
+  if (padded_len == 0) return 0;
+
+  struct fec_packet parity[FEC_MAX_M];
+  memset(parity, 0, sizeof(parity));
+
+  if (fec_encode(&ctx, conn->fec_send.packets, parity, padded_len) != 0)
+    return -1;
+
+  uint32_t group_id = conn->fec_send.group_id;
+
+  for (uint8_t i = 0; i < conn->fec_m; i++) {
+    uint8_t frame[MAX_DATAGRAM_SIZE];
+    build_header(frame, FRAME_TYPE_FEC, CONNECTION_STREAM_ID, 0);
+
+    struct frame_fec fec_hdr;
+    fec_hdr.group_id = group_id;
+    fec_hdr.fec_index = conn->fec_n + i;
+    fec_hdr.data_len = padded_len;
+
+    int body_off = frame_serialize_fec_body(frame + FRAME_HEADER_SIZE, &fec_hdr);
+    if (body_off < 0) return -1;
+
+    memcpy(frame + FRAME_HEADER_SIZE + body_off, parity[i].data, padded_len);
+    uint16_t frame_len = FRAME_HEADER_SIZE + (uint16_t)body_off + padded_len;
+
+    if (frame_len > MAX_DATAGRAM_SIZE) return -1;
+
+    if (fb_add(fb, frame, frame_len) != 0) {
+      if (fb_send(fb, conn) < 0) return -1;
+      fb_init(fb);
+      if (fb_add(fb, frame, frame_len) != 0) return -1;
+    }
+  }
+
+  fec_free(&ctx);
+  return 0;
+}
+
+/* Process a received FEC parity frame */
+static int process_fec_frame(struct reliable_conn *conn,
+                              const struct frame_fec *fec,
+                              const uint8_t *payload,
+                              uint32_t now_ms)
+{
+  (void)now_ms;
+  if (!conn->fec_enabled) return 0;
+
+  uint8_t n = conn->fec_n;
+  uint8_t m = conn->fec_m;
+  uint32_t group_id = fec->group_id;
+  uint8_t fec_idx = (uint8_t)fec->fec_index;
+  uint16_t data_len = fec->data_len;
+
+  if (n == 0 || m == 0) return 0;
+  if (fec_idx < n || fec_idx >= n + m) return 0;
+  if (data_len > FEC_MAX_PACKET_SIZE) return 0;
+
+  struct fec_recv_group *rg = &conn->fec_recv;
+
+  /* If starting a new group or group changed, reset if old group is
+   * stale. We only track one group at a time. */
+  if (!rg->active || rg->group_id != group_id) {
+    /* If we have a previously active group with enough packets, try to decode it */
+    if (rg->active && rg->received_count >= n) {
+      /* Try to decode old group later on next DATA frame arrival */
+    }
+    memset(rg, 0, sizeof(*rg));
+    rg->active = 1;
+    rg->group_id = group_id;
+  }
+
+  /* Store FEC parity packet */
+  uint8_t idx = fec_idx;
+  if (idx < FEC_MAX_GROUP_SIZE) {
+    if (!(rg->received_bitmask & ((uint64_t)1 << idx))) {
+      uint16_t copy_len = data_len < FEC_MAX_PACKET_SIZE ? data_len : FEC_MAX_PACKET_SIZE;
+      memcpy(rg->packets[idx].data, payload, copy_len);
+      rg->packets[idx].len = copy_len;
+      rg->data_lengths[idx] = copy_len;
+      rg->received_bitmask |= ((uint64_t)1 << idx);
+      rg->received_count++;
+    }
+  }
+
+  return 0;
+}
+
+/* Attempt FEC decode on the current receive group if enough packets received */
+static int fec_try_decode(struct reliable_conn *conn)
+{
+  struct fec_recv_group *rg = &conn->fec_recv;
+  if (!rg->active) return 0;
+  if (rg->received_count < conn->fec_n) return 0;
+
+  /* Check if all data indices (0..fec_n-1) have been received */
+  uint64_t data_mask = ((uint64_t)1 << conn->fec_n) - 1;
+  uint64_t recv_data = rg->received_bitmask & data_mask;
+  if (recv_data == data_mask) {
+    /* All data packets received - no decode needed */
+    rg->active = 0;
+    return 0;
+  }
+
+  /* Some data packets are missing. Count how many are missing. */
+  uint8_t missing_count = 0;
+  uint8_t missing_indices[FEC_MAX_M];
+  uint8_t total = conn->fec_n + conn->fec_m;
+
+  for (uint8_t i = 0; i < total && missing_count <= conn->fec_m; i++) {
+    if (!(rg->received_bitmask & ((uint64_t)1 << i))) {
+      missing_indices[missing_count++] = i;
+    }
+  }
+
+  if (missing_count > conn->fec_m) {
+    /* Too many losses, can't recover */
+    rg->active = 0;
+    return -1;
+  }
+
+  /* Build the packet array for decode (N+M entries) */
+  struct fec_packet decode_packets[FEC_MAX_GROUP_SIZE];
+  uint16_t padded_len = 0;
+
+  /* Find padded length from received packets */
+  for (uint8_t i = 0; i < total; i++) {
+    if (rg->received_bitmask & ((uint64_t)1 << i)) {
+      if (rg->data_lengths[i] > padded_len)
+        padded_len = rg->data_lengths[i];
+    }
+  }
+  if (padded_len == 0) { rg->active = 0; return -1; }
+  if (padded_len > FEC_MAX_PACKET_SIZE) padded_len = FEC_MAX_PACKET_SIZE;
+
+  /* Fill decode array */
+  for (uint8_t i = 0; i < total; i++) {
+    if (rg->received_bitmask & ((uint64_t)1 << i)) {
+      memcpy(decode_packets[i].data, rg->packets[i].data, rg->data_lengths[i]);
+      decode_packets[i].len = rg->data_lengths[i];
+    } else {
+      memset(decode_packets[i].data, 0, padded_len);
+      decode_packets[i].len = 0;
+    }
+  }
+
+  struct fec_ctx ctx;
+  fec_init(&ctx, conn->fec_n, conn->fec_m);
+
+  int ret = fec_decode(&ctx, decode_packets, missing_indices, missing_count, padded_len);
+
+  if (ret == 0) {
+    /* Deliver recovered data packets */
+    for (uint8_t i = 0; i < conn->fec_n; i++) {
+      if (!(rg->received_bitmask & ((uint64_t)1 << i))) {
+        /* This packet was missing and is now recovered.
+         * Deliver via process_data_frame by injecting a synthetic DATA frame. */
+        uint32_t packet_seq = rg->packet_seqs[i];
+        uint16_t stream_id = rg->stream_ids[i];
+        uint32_t stream_seq = rg->stream_seqs[i];
+
+        uint8_t frame_buf[MAX_DATAGRAM_SIZE];
+        uint8_t *payload = frame_buf + FRAME_HEADER_SIZE + FRAME_DATA_HEADER_SIZE;
+
+        build_header(frame_buf, FRAME_TYPE_DATA, stream_id, 0);
+
+        struct frame_data fd;
+        fd.packet_seq = packet_seq;
+        fd.stream_seq = stream_seq;
+        fd.data_len = padded_len;
+        frame_serialize_data_body(frame_buf + FRAME_HEADER_SIZE, &fd);
+
+        uint16_t copy_len = padded_len;
+        if (copy_len > MAX_DATAGRAM_SIZE - FRAME_HEADER_SIZE - FRAME_DATA_HEADER_SIZE)
+          copy_len = MAX_DATAGRAM_SIZE - FRAME_HEADER_SIZE - FRAME_DATA_HEADER_SIZE;
+        memcpy(payload, decode_packets[i].data, copy_len);
+        fd.data_len = copy_len;
+
+        process_data_frame(conn, stream_id, &fd, payload, 0);
+      }
+    }
+  }
+
+  fec_free(&ctx);
+  rg->active = 0;
+  return 0;
+}
+
+/* Track a received DATA packet in the FEC receive group */
+static int fec_track_recv_packet(struct reliable_conn *conn,
+                                  uint32_t packet_seq,
+                                  uint16_t stream_id,
+                                  uint32_t stream_seq,
+                                  const uint8_t *payload,
+                                  uint16_t payload_len)
+{
+  if (!conn->fec_enabled) return 0;
+
+  uint8_t n = conn->fec_n;
+  if (n == 0) return 0;
+
+  uint32_t group_id = fec_group_id(packet_seq, n);
+  uint8_t idx = fec_index_from_seq(packet_seq, n);
+
+  if (idx >= n) return 0;
+
+  struct fec_recv_group *rg = &conn->fec_recv;
+
+  if (!rg->active || rg->group_id != group_id) {
+    /* Try decoding previous group if possible */
+    if (rg->active && rg->received_count >= n)
+      fec_try_decode(conn);
+
+    memset(rg, 0, sizeof(*rg));
+    rg->active = 1;
+    rg->group_id = group_id;
+  }
+
+  if (!(rg->received_bitmask & ((uint64_t)1 << idx))) {
+    uint16_t copy_len = payload_len < FEC_MAX_PACKET_SIZE ? payload_len : FEC_MAX_PACKET_SIZE;
+    memcpy(rg->packets[idx].data, payload, copy_len);
+    rg->packets[idx].len = copy_len;
+    rg->packet_seqs[idx] = packet_seq;
+    rg->stream_ids[idx] = stream_id;
+    rg->stream_seqs[idx] = stream_seq;
+    rg->data_lengths[idx] = copy_len;
+    rg->received_bitmask |= ((uint64_t)1 << idx);
+    rg->received_count++;
+  }
+
+  return 0;
+}
+
+/* Adaptive FEC: adjust M based on loss rate every FEC_ADAPT_INTERVAL packets */
+static void fec_adaptive_update(struct reliable_conn *conn)
+{
+  if (conn->fec_total_counter < FEC_ADAPT_INTERVAL) return;
+
+  float loss_rate = (float)conn->fec_loss_counter / (float)conn->fec_total_counter;
+  uint8_t new_m = fec_adaptive_m(loss_rate);
+  if (new_m > FEC_MAX_M) new_m = FEC_MAX_M;
+  if (new_m < 1) new_m = 1;
+  conn->fec_m = new_m;
+  conn->fec_loss_counter = 0;
+  conn->fec_total_counter = 0;
 }
 
 /* ------------------------------------------------------------------ */
@@ -675,6 +1005,17 @@ static int send_stream_data(struct reliable_conn *conn,
       if (fb_add(fb, frame, frame_len) != 0) return -1;
     }
 
+    /* FEC: track reliable data packets for forward error correction */
+    if (stream->reliable && conn->fec_enabled) {
+      const uint8_t *pload = frame + FRAME_HEADER_SIZE + body_off;
+      if (fec_track_sent_packet(conn, packet_seq, stream->stream_id,
+                                 fd.stream_seq, pload, (uint16_t)chunk_len)) {
+        if (fec_send_parity(conn, fb, now_ms) != 0) return -1;
+      }
+      conn->fec_total_counter++;
+      fec_adaptive_update(conn);
+    }
+
     if (!stream->reliable) {
       /* Unreliable: don't retransmit */
       if (ie) ie->valid = 0;
@@ -746,7 +1087,7 @@ struct reliable_conn* reliable_conn_create(uint32_t session_id,
   conn->session_id = session_id;
   conn->send_fn = send_fn;
   conn->send_ctx = send_ctx;
-  conn->next_packet_seq = 1;
+  conn->next_packet_seq = 0;
   conn->max_ack_delay_ms = DEFAULT_MAX_ACK_DELAY_MS;
   conn->is_initiator = 0;
   conn->next_initiator_stream_id = STREAM_ID_INITIATOR_BASE;
@@ -759,6 +1100,15 @@ struct reliable_conn* reliable_conn_create(uint32_t session_id,
 
   rtt_init(&conn->rtt);
   ack_tracker_init(&conn->ack_tx);
+
+  /* FEC initialization */
+  conn->fec_enabled = 1;
+  conn->fec_n = FEC_DEFAULT_N;
+  conn->fec_m = FEC_DEFAULT_M;
+  conn->fec_loss_counter = 0;
+  conn->fec_total_counter = 0;
+  memset(&conn->fec_send, 0, sizeof(conn->fec_send));
+  memset(&conn->fec_recv, 0, sizeof(conn->fec_recv));
 
   memset(&conn->peer_addr, 0, sizeof(conn->peer_addr));
 
@@ -962,6 +1312,7 @@ int reliable_conn_tick(struct reliable_conn *conn, uint32_t now_ms)
     e->retransmits++;
     conn->packets_lost++;
     conn->packets_retransmitted++;
+    conn->fec_loss_counter++;
 
     uint32_t new_seq = conn->next_packet_seq++;
     uint8_t frame[MAX_DATAGRAM_SIZE];
@@ -1104,6 +1455,21 @@ int reliable_conn_input(struct reliable_conn *conn,
         if (fd.data_len > body_len - FRAME_DATA_HEADER_SIZE) return -1;
         const uint8_t *payload = body + FRAME_DATA_HEADER_SIZE;
         process_data_frame(conn, hdr.stream_id, &fd, payload, now_ms);
+        break;
+      }
+
+      case FRAME_TYPE_FEC: {
+        const uint8_t *body = frame + FRAME_HEADER_SIZE;
+        uint16_t body_len = frame_len - FRAME_HEADER_SIZE;
+        if (body_len < FRAME_FEC_BODY_SIZE) return -1;
+        struct frame_fec fec_frame;
+        if (frame_deserialize_fec_body(&fec_frame, body) != FRAME_FEC_BODY_SIZE)
+          return -1;
+        const uint8_t *fec_payload = body + FRAME_FEC_BODY_SIZE;
+        uint16_t fec_payload_len = body_len - FRAME_FEC_BODY_SIZE;
+        if (fec_payload_len < fec_frame.data_len) return -1;
+        process_fec_frame(conn, &fec_frame, fec_payload, now_ms);
+        fec_try_decode(conn);
         break;
       }
 

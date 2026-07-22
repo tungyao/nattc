@@ -42,6 +42,7 @@ add_executable(test_reliable_udp
     test_reliable_udp.c
     reliable_udp.c
     frame.c
+    fec.c
 )
 target_compile_definitions(test_reliable_udp PRIVATE _GNU_SOURCE)
 if(UNIX AND NOT APPLE)

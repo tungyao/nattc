@@ -13,6 +13,7 @@
 /* Frame types */
 #define FRAME_TYPE_DATA          0x01
 #define FRAME_TYPE_ACK           0x02
+#define FRAME_TYPE_FEC           0x03
 #define FRAME_TYPE_STREAM_OPEN   0x04
 #define FRAME_TYPE_STREAM_CLOSE  0x05
 #define FRAME_TYPE_PING          0x06
@@ -57,6 +58,15 @@ struct frame_data {
 /* Size of DATA frame header (fixed part before payload) */
 #define FRAME_DATA_HEADER_SIZE (sizeof(uint32_t) + sizeof(uint32_t) + sizeof(uint16_t))
 
+/* FEC frame body (after header) */
+struct frame_fec {
+  uint32_t group_id;
+  uint16_t fec_index;
+  uint16_t data_len;
+};
+
+#define FRAME_FEC_BODY_SIZE (sizeof(uint32_t) + sizeof(uint16_t) + sizeof(uint16_t))
+
 /* ACK range entry */
 struct ack_range {
   uint16_t gap;
@@ -94,6 +104,10 @@ int frame_deserialize_header(struct frame_header *hdr, const uint8_t *buf);
 /* Serialize/deserialize DATA frame body (payload follows the fixed header) */
 int frame_serialize_data_body(uint8_t *buf, const struct frame_data *data);
 int frame_deserialize_data_body(struct frame_data *data, const uint8_t *buf);
+
+/* Serialize/deserialize FEC frame body */
+int frame_serialize_fec_body(uint8_t *buf, const struct frame_fec *fec);
+int frame_deserialize_fec_body(struct frame_fec *fec, const uint8_t *buf);
 
 /* Serialize/deserialize ACK frame body with variable ranges */
 int frame_serialize_ack_body(uint8_t *buf, const struct frame_ack *ack,

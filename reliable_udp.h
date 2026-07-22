@@ -7,6 +7,7 @@
 #include <netinet/in.h> /* struct sockaddr_in */
 
 #include "frame.h"
+#include "fec.h"
 
 /* Default buffer sizes */
 #define RELIABLE_STREAM_SEND_BUF_SIZE (64 * 1024)
@@ -74,6 +75,7 @@ struct ack_tracker {
   uint32_t base_seq;
   uint32_t max_seq;
   uint32_t last_received_time;
+  uint32_t received_count;
   uint8_t bitmap[PACKET_HISTORY_SIZE];
 };
 
@@ -169,6 +171,15 @@ struct reliable_conn {
 
   /* Conn tick state */
   uint32_t last_tick_ms;
+
+  /* FEC state (Phase 3) */
+  uint8_t fec_enabled;
+  uint8_t fec_n;
+  uint8_t fec_m;
+  uint32_t fec_loss_counter;
+  uint32_t fec_total_counter;
+  struct fec_send_group fec_send;
+  struct fec_recv_group fec_recv;
 
   /* Linked list of connections (if needed) */
   struct reliable_conn *next;

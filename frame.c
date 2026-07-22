@@ -69,6 +69,36 @@ int frame_deserialize_data_body(struct frame_data *data, const uint8_t *buf)
   return FRAME_DATA_HEADER_SIZE;
 }
 
+/* FEC body: group_id(4) + fec_index(2) + data_len(2) + payload */
+int frame_serialize_fec_body(uint8_t *buf, const struct frame_fec *fec)
+{
+  if (!buf || !fec) return -1;
+  uint32_t gid = fec->group_id;
+  buf[0] = (uint8_t)(gid >> 24);
+  buf[1] = (uint8_t)(gid >> 16);
+  buf[2] = (uint8_t)(gid >> 8);
+  buf[3] = (uint8_t)(gid & 0xFF);
+  uint16_t fi = fec->fec_index;
+  buf[4] = (uint8_t)(fi >> 8);
+  buf[5] = (uint8_t)(fi & 0xFF);
+  uint16_t dl = fec->data_len;
+  buf[6] = (uint8_t)(dl >> 8);
+  buf[7] = (uint8_t)(dl & 0xFF);
+  return FRAME_FEC_BODY_SIZE;
+}
+
+int frame_deserialize_fec_body(struct frame_fec *fec, const uint8_t *buf)
+{
+  if (!fec || !buf) return -1;
+  fec->group_id = ((uint32_t)buf[0] << 24)
+                | ((uint32_t)buf[1] << 16)
+                | ((uint32_t)buf[2] << 8)
+                | buf[3];
+  fec->fec_index = ((uint16_t)buf[4] << 8) | buf[5];
+  fec->data_len = ((uint16_t)buf[6] << 8) | buf[7];
+  return FRAME_FEC_BODY_SIZE;
+}
+
 /* ACK body: largest_acked(4) + ack_delay(2) + first_ack_range(2)
  *          + range_count(2) + ranges(range_count * 4 each) */
 int frame_serialize_ack_body(uint8_t *buf, const struct frame_ack *ack,
