@@ -415,8 +415,9 @@ static int fec_track_recv_packet(struct reliable_conn *conn,
                                   uint16_t stream_id,
                                   uint32_t stream_seq,
                                   const uint8_t *payload,
-                                  uint16_t payload_len);
-static int fec_try_decode(struct reliable_conn *conn);
+                                  uint16_t payload_len,
+                                  uint32_t now_ms);
+static int fec_try_decode(struct reliable_conn *conn, uint32_t now_ms);
 
 /* ------------------------------------------------------------------ */
 /*  Process a received DATA frame                                     */
@@ -454,7 +455,7 @@ static int process_data_frame(struct reliable_conn *conn,
 
   /* FEC: track received data packet for forward error correction */
   fec_track_recv_packet(conn, data->packet_seq, stream_id,
-                         data->stream_seq, payload, data->data_len);
+                         data->stream_seq, payload, data->data_len, now_ms);
 
   /* In-order: write to recv buffer directly */
   uint32_t space = RELIABLE_STREAM_RECV_BUF_SIZE
@@ -478,7 +479,7 @@ static int process_data_frame(struct reliable_conn *conn,
   drain_recv_pending(stream);
 
   /* Try FEC decode now that we have a new data packet */
-  fec_try_decode(conn);
+  fec_try_decode(conn, now_ms);
 
   return 0;
 }
@@ -663,6 +664,8 @@ static int fec_send_parity(struct reliable_conn *conn,
 
   uint16_t padded_len = fec_padded_length(conn->fec_send.packets, conn->fec_n);
   if (padded_len == 0) return 0;
+  uint16_t max_padded = MAX_DATAGRAM_SIZE - FRAME_HEADER_SIZE - FRAME_FEC_BODY_SIZE;
+  if (padded_len > max_padded) padded_len = max_padded;
 
   struct fec_packet parity[FEC_MAX_M];
   memset(parity, 0, sizeof(parity));
@@ -694,6 +697,7 @@ static int fec_send_parity(struct reliable_conn *conn,
       fb_init(fb);
       if (fb_add(fb, frame, frame_len) != 0) return -1;
     }
+    conn->conn_bytes_in_flight += frame_len + FRAME_LENGTH_FIELD_SIZE;
   }
 
   fec_free(&ctx);
@@ -750,7 +754,7 @@ static int process_fec_frame(struct reliable_conn *conn,
 }
 
 /* Attempt FEC decode on the current receive group if enough packets received */
-static int fec_try_decode(struct reliable_conn *conn)
+static int fec_try_decode(struct reliable_conn *conn, uint32_t now_ms)
 {
   struct fec_recv_group *rg = &conn->fec_recv;
   if (!rg->active) return 0;
@@ -839,7 +843,7 @@ static int fec_try_decode(struct reliable_conn *conn)
         memcpy(payload, decode_packets[i].data, copy_len);
         fd.data_len = copy_len;
 
-        process_data_frame(conn, stream_id, &fd, payload, 0);
+        process_data_frame(conn, stream_id, &fd, payload, now_ms);
       }
     }
   }
@@ -855,7 +859,8 @@ static int fec_track_recv_packet(struct reliable_conn *conn,
                                   uint16_t stream_id,
                                   uint32_t stream_seq,
                                   const uint8_t *payload,
-                                  uint16_t payload_len)
+                                  uint16_t payload_len,
+                                  uint32_t now_ms)
 {
   if (!conn->fec_enabled) return 0;
 
@@ -872,7 +877,7 @@ static int fec_track_recv_packet(struct reliable_conn *conn,
   if (!rg->active || rg->group_id != group_id) {
     /* Try decoding previous group if possible */
     if (rg->active && rg->received_count >= n)
-      fec_try_decode(conn);
+      fec_try_decode(conn, now_ms);
 
     memset(rg, 0, sizeof(*rg));
     rg->active = 1;
@@ -1469,7 +1474,7 @@ int reliable_conn_input(struct reliable_conn *conn,
         uint16_t fec_payload_len = body_len - FRAME_FEC_BODY_SIZE;
         if (fec_payload_len < fec_frame.data_len) return -1;
         process_fec_frame(conn, &fec_frame, fec_payload, now_ms);
-        fec_try_decode(conn);
+        fec_try_decode(conn, now_ms);
         break;
       }
 

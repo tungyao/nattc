@@ -90,6 +90,7 @@ void fec_init(struct fec_ctx *ctx, uint8_t n, uint8_t m)
   ctx->m = m;
   ctx->gf_log = gf_log;
   ctx->gf_exp = gf_exp;
+  ctx->gf_pow = NULL;
 }
 
 void fec_free(struct fec_ctx *ctx)
@@ -181,8 +182,11 @@ int fec_decode(struct fec_ctx *ctx, struct fec_packet *packets,
         packets[r].data[b] = sum;
     }
   }
-  for (uint8_t i = 0; i < n; i++)
-    packets[i].len = padded_len;
+  for (uint8_t k = 0; k < missing_count; k++) {
+    uint8_t idx = missing_indices[k];
+    if (idx < n)
+      packets[idx].len = padded_len;
+  }
   return 0;
 }
 

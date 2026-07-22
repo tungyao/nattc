@@ -22,6 +22,7 @@ struct fec_ctx {
   uint8_t m;
   uint8_t *gf_log;
   uint8_t *gf_exp;
+  uint8_t *gf_pow;
 };
 
 struct fec_send_group {
