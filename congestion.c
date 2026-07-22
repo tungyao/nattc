@@ -12,12 +12,27 @@ uint32_t cbrt_fp(uint32_t x)
   return y;
 }
 
+static double cbrt_double(double x)
+{
+  if (x == 0.0) return 0.0;
+  double y = x / 3.0;
+  for (int i = 0; i < 20; i++) {
+    double y2 = y * y;
+    double y_next = (2.0 * y + x / y2) / 3.0;
+    double diff = y_next - y;
+    if (diff < 0) diff = -diff;
+    if (diff < 1e-12 * y) break;
+    y = y_next;
+  }
+  return y;
+}
+
 void cubic_init(struct cubic_state *cubic, struct delay_monitor *delay, uint32_t initial_rtt_ms)
 {
   cubic->cwnd = CWND_INITIAL;
   cubic->ssthresh = SSTHRESH_INITIAL;
   cubic->w_max = 0;
-  cubic->k = 0;
+  cubic->k_q16 = 0;
   cubic->last_loss_time = 0;
   cubic->cubic_c = CUBIC_C_Q16;
   cubic->in_recovery = 0;
@@ -39,6 +54,7 @@ void cubic_on_loss(struct cubic_state *cubic, uint32_t now_ms)
   cubic->in_recovery = 1;
   cubic->last_loss_time = now_ms;
 
-  uint32_t w_max_scaled = (uint32_t)(((uint64_t)cubic->w_max * (65536 - 26214)) / 26214);
-  cubic->k = cbrt_fp(w_max_scaled);
+  double w_max_seg = (double)cubic->w_max / (double)CUBIC_MSS;
+  double k_sec = cbrt_double(w_max_seg * 0.75);
+  cubic->k_q16 = (uint32_t)(k_sec * 65536.0 + 0.5);
 }

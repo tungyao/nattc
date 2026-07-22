@@ -516,16 +516,17 @@ static void handle_acked_packet(struct reliable_conn *conn,
     if (conn->cubic.cwnd < conn->cubic.ssthresh) {
       conn->cubic.cwnd += e->payload_len;
     } else {
-      int32_t t_minus_K = (int32_t)(now_ms - conn->cubic.last_loss_time) - (int32_t)conn->cubic.k;
-      int64_t tdk3 = (int64_t)t_minus_K * t_minus_K * t_minus_K;
-      int64_t w_cubic = ((int64_t)tdk3 * (int64_t)conn->cubic.cubic_c) >> 16;
-      w_cubic += (int64_t)conn->cubic.w_max;
-      if (w_cubic < 0) w_cubic = 0;
-      uint32_t w_cubic_result = (uint32_t)w_cubic;
-      if (w_cubic_result < CWND_MIN)
-        w_cubic_result = CWND_MIN;
-      if (w_cubic_result > conn->cubic.cwnd)
-        conn->cubic.cwnd = w_cubic_result;
+      double t_sec = (double)(now_ms - conn->cubic.last_loss_time) / 1000.0;
+      double k_sec = (double)conn->cubic.k_q16 / 65536.0;
+      double delta_sec = t_sec - k_sec;
+      if (delta_sec > 0) {
+        double w_cubic_seg = 0.4 * delta_sec * delta_sec * delta_sec
+                           + (double)conn->cubic.w_max / (double)CUBIC_MSS;
+        if (w_cubic_seg < 0) w_cubic_seg = 0;
+        uint32_t w_cubic_bytes = (uint32_t)(w_cubic_seg * CUBIC_MSS + 0.5);
+        if (w_cubic_bytes > conn->cubic.cwnd)
+          conn->cubic.cwnd = w_cubic_bytes;
+      }
     }
   }
 
@@ -717,6 +718,7 @@ static int fec_send_parity(struct reliable_conn *conn,
                             struct frame_builder *fb,
                             uint32_t now_ms)
 {
+  (void)now_ms;
   struct fec_ctx ctx;
   fec_init(&ctx, conn->fec_n, conn->fec_m);
 
@@ -745,8 +747,16 @@ static int fec_send_parity(struct reliable_conn *conn,
     int body_off = frame_serialize_fec_body(frame + FRAME_HEADER_SIZE, &fec_hdr);
     if (body_off < 0) return -1;
 
-    memcpy(frame + FRAME_HEADER_SIZE + body_off, parity[i].data, padded_len);
-    uint16_t frame_len = FRAME_HEADER_SIZE + (uint16_t)body_off + padded_len;
+    uint8_t *payload_start = frame + FRAME_HEADER_SIZE + body_off;
+    memcpy(payload_start, parity[i].data, padded_len);
+
+    uint8_t *dl_ptr = payload_start + padded_len;
+    for (uint8_t j = 0; j < conn->fec_n; j++) {
+      dl_ptr[j * 2] = (uint8_t)(conn->fec_send.data_lengths[j] >> 8);
+      dl_ptr[j * 2 + 1] = (uint8_t)(conn->fec_send.data_lengths[j] & 0xFF);
+    }
+
+    uint16_t frame_len = FRAME_HEADER_SIZE + (uint16_t)body_off + padded_len + conn->fec_n * 2;
 
     if (frame_len > MAX_DATAGRAM_SIZE) return -1;
 
@@ -765,6 +775,7 @@ static int fec_send_parity(struct reliable_conn *conn,
 static int process_fec_frame(struct reliable_conn *conn,
                               const struct frame_fec *fec,
                               const uint8_t *payload,
+                              uint16_t payload_len,
                               uint32_t now_ms)
 {
   (void)now_ms;
@@ -801,9 +812,18 @@ static int process_fec_frame(struct reliable_conn *conn,
       uint16_t copy_len = data_len < FEC_MAX_PACKET_SIZE ? data_len : FEC_MAX_PACKET_SIZE;
       memcpy(rg->packets[idx].data, payload, copy_len);
       rg->packets[idx].len = copy_len;
-      rg->data_lengths[idx] = copy_len;
       rg->received_bitmask |= ((uint64_t)1 << idx);
       rg->received_count++;
+    }
+  }
+
+  /* Extract original data lengths from FEC frame (embedded after parity payload) */
+  if (payload_len >= data_len + (uint16_t)n * 2) {
+    const uint8_t *dl = payload + data_len;
+    for (uint8_t i = 0; i < n; i++) {
+      uint16_t orig_len = ((uint16_t)dl[i * 2] << 8) | dl[i * 2 + 1];
+      if (rg->data_lengths[i] == 0 || orig_len != 0)
+        rg->data_lengths[i] = orig_len;
     }
   }
 
@@ -877,28 +897,30 @@ static int fec_try_decode(struct reliable_conn *conn, uint32_t now_ms)
     /* Deliver recovered data packets */
     for (uint8_t i = 0; i < conn->fec_n; i++) {
       if (!(rg->received_bitmask & ((uint64_t)1 << i))) {
-        /* This packet was missing and is now recovered.
-         * Deliver via process_data_frame by injecting a synthetic DATA frame. */
         uint32_t packet_seq = rg->packet_seqs[i];
         uint16_t stream_id = rg->stream_ids[i];
         uint32_t stream_seq = rg->stream_seqs[i];
+
+        uint16_t orig_len = rg->data_lengths[i];
+        if (orig_len == 0 || orig_len > padded_len)
+          orig_len = padded_len;
 
         uint8_t frame_buf[MAX_DATAGRAM_SIZE];
         uint8_t *payload = frame_buf + FRAME_HEADER_SIZE + FRAME_DATA_HEADER_SIZE;
 
         build_header(frame_buf, FRAME_TYPE_DATA, stream_id, 0);
 
+        uint16_t copy_len = orig_len;
+        if (copy_len > MAX_DATAGRAM_SIZE - FRAME_HEADER_SIZE - FRAME_DATA_HEADER_SIZE)
+          copy_len = MAX_DATAGRAM_SIZE - FRAME_HEADER_SIZE - FRAME_DATA_HEADER_SIZE;
+
         struct frame_data fd;
         fd.packet_seq = packet_seq;
         fd.stream_seq = stream_seq;
-        fd.data_len = padded_len;
+        fd.data_len = copy_len;
         frame_serialize_data_body(frame_buf + FRAME_HEADER_SIZE, &fd);
 
-        uint16_t copy_len = padded_len;
-        if (copy_len > MAX_DATAGRAM_SIZE - FRAME_HEADER_SIZE - FRAME_DATA_HEADER_SIZE)
-          copy_len = MAX_DATAGRAM_SIZE - FRAME_HEADER_SIZE - FRAME_DATA_HEADER_SIZE;
         memcpy(payload, decode_packets[i].data, copy_len);
-        fd.data_len = copy_len;
 
         process_data_frame(conn, stream_id, &fd, payload, now_ms);
       }
@@ -1411,6 +1433,7 @@ int reliable_conn_tick(struct reliable_conn *conn, uint32_t now_ms)
     e->packet_seq = new_seq;
     e->send_time_ms = now_ms;
     e->acked = 0;
+    e->dup_ack_count = 0;
 
     if (fb_add(&fb, frame, frame_len) != 0) {
       if (fb_send(&fb, conn) < 0) return -1;
@@ -1545,7 +1568,7 @@ int reliable_conn_input(struct reliable_conn *conn,
         const uint8_t *fec_payload = body + FRAME_FEC_BODY_SIZE;
         uint16_t fec_payload_len = body_len - FRAME_FEC_BODY_SIZE;
         if (fec_payload_len < fec_frame.data_len) return -1;
-        process_fec_frame(conn, &fec_frame, fec_payload, now_ms);
+        process_fec_frame(conn, &fec_frame, fec_payload, fec_payload_len, now_ms);
         fec_try_decode(conn, now_ms);
         break;
       }

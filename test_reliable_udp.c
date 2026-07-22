@@ -1214,7 +1214,7 @@ static void test_fec_no_loss(void)
     memcpy(&decode_packets[i], &data[i], sizeof(data[i]));
 
   /* With no missing packets, we can just pass empty missing array */
-  uint8_t missing[] = {};
+  uint8_t missing[1] = {0};
   int ret = fec_decode(&ctx, decode_packets, missing, 0, plen);
   assert(ret == 0);
 
@@ -1334,7 +1334,7 @@ static void test_cubic_loss_recovery(void)
   assert(conn->cubic.cwnd < cwnd_before);
   assert(conn->cubic.ssthresh < cwnd_before);
   assert(conn->cubic.w_max >= cwnd_before);
-  assert(conn->cubic.k > 0);
+  assert(conn->cubic.k_q16 > 0);
   reliable_conn_destroy(conn);
   PASS();
 }
@@ -1345,13 +1345,11 @@ static void test_cubic_congestion_avoidance(void)
   struct loopback_ctx lb;
   struct reliable_conn *conn = setup_conn(&lb, 202);
 
-  conn->cubic.w_max = 10000;
-  conn->cubic.last_loss_time = 0;
+  conn->cubic.cwnd = 10000;
+  cubic_on_loss(&conn->cubic, 0);
   conn->cubic.ssthresh = 50000;
   conn->cubic.cwnd = conn->cubic.ssthresh;
   conn->cubic.in_recovery = 0;
-  uint32_t w_max_scaled = (uint32_t)(((uint64_t)conn->cubic.w_max * (65536 - 26214)) / 26214);
-  conn->cubic.k = cbrt_fp(w_max_scaled);
   uint32_t cwnd_before = conn->cubic.cwnd;
 
   struct reliable_stream *s = reliable_stream_open(conn, 1, 1, 0);
@@ -1362,10 +1360,9 @@ static void test_cubic_congestion_avoidance(void)
   uint8_t dgram[MAX_DATAGRAM_SIZE];
   uint16_t dgram_len;
   build_ack_datagram(dgram, &dgram_len, 0, 1);
-  reliable_conn_input(conn, dgram, dgram_len, 1000);
+  reliable_conn_input(conn, dgram, dgram_len, 10000);
 
-  /* In CA, cwnd may be capped at ssthresh; verify the cubic state is populated */
-  assert(conn->cubic.k > 0);
+  assert(conn->cubic.k_q16 > 0);
   assert(conn->cubic.cubic_c == 26214);
   assert(conn->cubic.cwnd > cwnd_before);
   reliable_conn_destroy(conn);
