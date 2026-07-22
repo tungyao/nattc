@@ -8,6 +8,7 @@
 
 #include "frame.h"
 #include "fec.h"
+#include "congestion.h"
 
 /* Default buffer sizes */
 #define RELIABLE_STREAM_SEND_BUF_SIZE (64 * 1024)
@@ -157,13 +158,20 @@ struct reliable_conn {
   uint32_t conn_bytes_in_flight;
   uint32_t conn_send_window;
 
-  /* Stats for congestion (minimal for now) */
+  /* Stats */
   uint32_t bytes_sent;
   uint32_t bytes_received;
   uint32_t packets_sent;
   uint32_t packets_received;
   uint32_t packets_lost;
   uint32_t packets_retransmitted;
+
+  /* Congestion control (CUBIC + delay awareness) */
+  struct cubic_state cubic;
+  struct delay_monitor delay;
+  uint32_t bytes_acked_since_last_estimate;
+  uint32_t last_bandwidth_estimate_ms;
+  uint32_t delivery_rate;
 
   /* Time-based ACK generation */
   uint32_t last_ack_send_ms;

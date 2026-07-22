@@ -1,5 +1,6 @@
 #include "reliable_udp.h"
 #include "fec.h"
+#include "congestion.h"
 #include <stdlib.h>
 #include <string.h>
 #include <sys/time.h>
@@ -13,6 +14,8 @@
 #define Q16_ONE (1 << Q16_SHIFT)
 #define Q16_FROM_MS(ms) ((uint32_t)((ms) << Q16_SHIFT))
 #define Q16_TO_MS(q16)  ((q16) >> Q16_SHIFT)
+#define Q16_MUL(a, b)  ((uint32_t)(((uint64_t)(a) * (b)) >> Q16_SHIFT))
+#define Q16_DIV(a, b)  ((uint32_t)(((uint64_t)(a) << Q16_SHIFT) / (b)))
 
 /* ------------------------------------------------------------------ */
 /*  Frame builder: coalesce frames into a datagram                    */
@@ -507,6 +510,33 @@ static void handle_acked_packet(struct reliable_conn *conn,
     s->flow.bytes_in_flight -= e->payload_len;
   if (conn->conn_bytes_in_flight >= e->payload_len)
     conn->conn_bytes_in_flight -= e->payload_len;
+
+  /* Congestion control: cwnd growth (only if not in recovery) */
+  if (!conn->cubic.in_recovery) {
+    if (conn->cubic.cwnd < conn->cubic.ssthresh) {
+      conn->cubic.cwnd += e->payload_len;
+    } else {
+      int32_t t_minus_K = (int32_t)(now_ms - conn->cubic.last_loss_time) - (int32_t)conn->cubic.k;
+      int64_t tdk3 = (int64_t)t_minus_K * t_minus_K * t_minus_K;
+      int64_t w_cubic = ((int64_t)tdk3 * (int64_t)conn->cubic.cubic_c) >> 16;
+      w_cubic += (int64_t)conn->cubic.w_max;
+      if (w_cubic < 0) w_cubic = 0;
+      conn->cubic.cwnd = (uint32_t)w_cubic;
+      if (conn->cubic.cwnd < CWND_MIN)
+        conn->cubic.cwnd = CWND_MIN;
+      if (conn->cubic.cwnd > conn->cubic.ssthresh)
+        conn->cubic.cwnd = conn->cubic.ssthresh;
+    }
+  }
+
+  /* Bandwidth estimation */
+  conn->bytes_acked_since_last_estimate += e->payload_len;
+  uint32_t smoothed_ms = Q16_TO_MS(conn->rtt.smoothed_rtt);
+  if (smoothed_ms > 0 && now_ms - conn->last_bandwidth_estimate_ms >= smoothed_ms) {
+    conn->delivery_rate = Q16_DIV(conn->bytes_acked_since_last_estimate, smoothed_ms);
+    conn->bytes_acked_since_last_estimate = 0;
+    conn->last_bandwidth_estimate_ms = now_ms;
+  }
 }
 
 static void process_ack_frame(struct reliable_conn *conn,
@@ -562,6 +592,8 @@ static void process_ack_frame(struct reliable_conn *conn,
         e->dup_ack_count++;
         if (e->dup_ack_count >= 3) {
           /* Fast retransmit */
+          if (!conn->cubic.in_recovery)
+            cubic_on_loss(&conn->cubic, now_ms);
           e->retransmits++;
           conn->packets_lost++;
           conn->packets_retransmitted++;
@@ -604,6 +636,32 @@ static void process_ack_frame(struct reliable_conn *conn,
     struct inflight_entry *e = &conn->inflight[i];
     if (e->valid && e->acked)
       e->valid = 0;
+  }
+
+  /* Recovery exit check: clear in_recovery after 1 RTT with no loss */
+  if (conn->cubic.in_recovery) {
+    uint32_t rtt_ms = Q16_TO_MS(conn->rtt.smoothed_rtt);
+    if (now_ms - conn->cubic.last_loss_time > rtt_ms)
+      conn->cubic.in_recovery = 0;
+  }
+
+  /* Delay monitor */
+  {
+    uint32_t current_rtt_ms = conn->rtt.latest_rtt;
+    uint32_t current_rtt_q16 = Q16_FROM_MS(current_rtt_ms);
+    if (current_rtt_q16 > conn->delay.rtt_threshold &&
+        !conn->delay.delay_reduced) {
+      conn->cubic.cwnd = (uint32_t)((uint64_t)conn->cubic.cwnd * 55705 >> 16);
+      if (conn->cubic.cwnd < CWND_MIN)
+        conn->cubic.cwnd = CWND_MIN;
+      conn->delay.delay_reduced = 1;
+      conn->delay.last_delay_reduce = now_ms;
+    }
+    if (conn->delay.delay_reduced) {
+      uint32_t rtt_ms = Q16_TO_MS(conn->rtt.smoothed_rtt);
+      if (now_ms - conn->delay.last_delay_reduce > rtt_ms)
+        conn->delay.delay_reduced = 0;
+    }
   }
 }
 
@@ -935,6 +993,14 @@ static int send_stream_data(struct reliable_conn *conn,
 
     uint32_t chunk_len = avail < MAX_FRAME_BODY ? avail : MAX_FRAME_BODY;
 
+    /* Congestion control: don't exceed cwnd */
+    if (conn->cubic.cwnd > conn->conn_bytes_in_flight) {
+      uint32_t cwnd_rem = conn->cubic.cwnd - conn->conn_bytes_in_flight;
+      if (chunk_len > cwnd_rem) chunk_len = cwnd_rem;
+    } else {
+      break;
+    }
+
     /* Don't exceed remaining window (absolute offset limit) */
     if (stream->reliable) {
       if (stream->total_bytes_sent >= stream->flow.send_window) break;
@@ -1104,6 +1170,11 @@ struct reliable_conn* reliable_conn_create(uint32_t session_id,
 
   rtt_init(&conn->rtt);
   ack_tracker_init(&conn->ack_tx);
+
+  cubic_init(&conn->cubic, &conn->delay);
+  conn->bytes_acked_since_last_estimate = 0;
+  conn->last_bandwidth_estimate_ms = 0;
+  conn->delivery_rate = 0;
 
   /* FEC initialization */
   conn->fec_enabled = 1;
@@ -1313,6 +1384,8 @@ int reliable_conn_tick(struct reliable_conn *conn, uint32_t now_ms)
     if (now_ms - e->send_time_ms <= timeout_ms) continue;
 
     /* Timeout - retransmit */
+    if (!conn->cubic.in_recovery)
+      cubic_on_loss(&conn->cubic, now_ms);
     e->retransmits++;
     conn->packets_lost++;
     conn->packets_retransmitted++;
