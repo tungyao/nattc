@@ -17,10 +17,6 @@ typedef SSIZE_T ssize_t;
 #include <sys/socket.h>
 #endif
 
-/* Pack all network protocol structs to ensure consistent layout across architectures */
-/* GCC, Clang, and MSVC all support #pragma pack */
-#pragma pack(push, 1)
-
 /* Magic number for protocol identification */
 #define PROTO_MAGIC 0xCAFE
 
@@ -169,8 +165,6 @@ struct punch_ack {
 struct heartbeat_resp {
     struct sockaddr_in public_addr;
 };
-
-#pragma pack(pop)
 
 /* Peer states */
 enum peer_state {
