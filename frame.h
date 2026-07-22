@@ -46,7 +46,7 @@ struct frame_header {
 };
 
 /* Maximum body we can fit in a frame (after header, in one datagram) */
-#define MAX_FRAME_BODY (MAX_DATAGRAM_SIZE - FRAME_HEADER_SIZE - FRAME_LENGTH_FIELD_SIZE)
+#define MAX_FRAME_BODY (MAX_DATAGRAM_SIZE - FRAME_HEADER_SIZE - FRAME_DATA_HEADER_SIZE - FRAME_LENGTH_FIELD_SIZE)
 
 /* DATA frame body (after header) */
 struct frame_data {
