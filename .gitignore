@@ -6,3 +6,5 @@ dist/
 *.obj
 *.exe
 docs/
+scripts/
+generate_chapter*
