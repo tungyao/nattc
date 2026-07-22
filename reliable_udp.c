@@ -697,7 +697,6 @@ static int fec_send_parity(struct reliable_conn *conn,
       fb_init(fb);
       if (fb_add(fb, frame, frame_len) != 0) return -1;
     }
-    conn->conn_bytes_in_flight += frame_len + FRAME_LENGTH_FIELD_SIZE;
   }
 
   fec_free(&ctx);
