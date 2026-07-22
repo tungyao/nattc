@@ -3,8 +3,13 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#ifdef _WIN32
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#else
 #include <sys/socket.h> /* struct sockaddr, socklen_t */
 #include <netinet/in.h> /* struct sockaddr_in */
+#endif
 
 #include "frame.h"
 #include "fec.h"

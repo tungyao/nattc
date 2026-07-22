@@ -3,7 +3,11 @@
 #include "congestion.h"
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
+#include <winsock2.h>
+#else
 #include <sys/time.h>
+#endif
 
 #define WINDOW_UPDATE_FREE_RATIO 2
 
@@ -1702,7 +1706,11 @@ uint32_t reliable_conn_get_min_rtt_ms(struct reliable_conn *conn)
 
 uint32_t reliable_time_ms(void)
 {
+#ifdef _WIN32
+  return (uint32_t)GetTickCount64();
+#else
   struct timeval tv;
   gettimeofday(&tv, NULL);
   return (uint32_t)((int64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000);
+#endif
 }
