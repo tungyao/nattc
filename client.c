@@ -779,6 +779,15 @@ void client_run(struct client_context *ctx) {
                 {
                     struct peer_session *rp = ctx->peers;
                     int handled = 0;
+                    /* Update last_rx_time for matching peer regardless of state */
+                    while (rp) {
+                        if (rp->public_addr.sin_port == src_addr.sin_port) {
+                            rp->last_rx_time = time(NULL);
+                            break;
+                        }
+                        rp = rp->next;
+                    }
+                    rp = ctx->peers;
                     while (rp) {
                         if (rp->rconn &&
                             rp->state == PEER_STATE_ESTABLISHED &&
