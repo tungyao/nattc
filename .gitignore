@@ -8,3 +8,4 @@ dist/
 docs/
 scripts/
 generate_chapter*
+reasonix.toml
