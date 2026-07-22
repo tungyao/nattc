@@ -1242,6 +1242,11 @@ void client_handle_punch_echo(struct client_context *ctx, const struct sockaddr_
             peer->session_id = session_id;
             printf("Session updated to %u\n", session_id);
         }
+        /* Sync rconn peer address — keep in sync with public_addr */
+        if (peer->rconn && (peer->rconn->peer_addr.sin_addr.s_addr != src_addr->sin_addr.s_addr ||
+                            peer->rconn->peer_addr.sin_port != src_addr->sin_port)) {
+            reliable_conn_set_peer(peer->rconn, src_addr);
+        }
         struct punch_ack ack;
         ack.session_id = htonl(peer->session_id);
         send_msg(ctx->udp_fd, src_addr, MSG_PUNCH_ACK, 0, &ack, sizeof(ack));
