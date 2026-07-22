@@ -17,7 +17,7 @@ int main(int argc, char *argv[]) {
     const char *client_id = NULL;
     const char *virtual_ip = NULL;
 
-    if (argc < 4) {
+    if (argc < 3) {
         fprintf(stderr, "Usage: %s <client_id> <virtual_ip> [server_ip] [server_port]\n", argv[0]);
         fprintf(stderr, "  client_id:    unique identifier for this client\n");
         fprintf(stderr, "  virtual_ip:   virtual IP address (e.g. 10.0.0.1)\n");

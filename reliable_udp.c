@@ -3,6 +3,7 @@
 #include "congestion.h"
 #include <stdlib.h>
 #include <string.h>
+#include <stdio.h>
 #ifdef _WIN32
 #include <winsock2.h>
 #else
@@ -49,8 +50,8 @@ static int fb_send(struct frame_builder *fb, struct reliable_conn *conn)
 {
   if (fb->offset == 0) return 0;
   return conn->send_fn(conn->send_ctx, fb->buf, fb->offset,
-                        (const struct sockaddr *)&conn->peer_addr,
-                        sizeof(conn->peer_addr));
+                         (const struct sockaddr *)&conn->peer_addr,
+                         sizeof(conn->peer_addr));
 }
 
 /* ------------------------------------------------------------------ */
@@ -435,8 +436,9 @@ static int process_data_frame(struct reliable_conn *conn,
                                const uint8_t *payload, uint32_t now_ms)
 {
   struct reliable_stream *stream = find_stream(conn, stream_id);
-  if (!stream)
+  if (!stream) {
     return -1;
+  }
 
   /* Record packet in ACK tracker */
   ack_tracker_received(&conn->ack_tx, data->packet_seq, now_ms);
@@ -1010,12 +1012,14 @@ static int send_stream_data(struct reliable_conn *conn,
   while (avail > 0) {
     /* Check stream-level flow control (absolute byte offset) */
     if (stream->reliable &&
-        stream->total_bytes_sent >= stream->flow.send_window)
+        stream->total_bytes_sent >= stream->flow.send_window) {
       break;
+    }
 
     /* Check connection-level flow control */
-    if (conn->conn_bytes_in_flight >= conn->conn_send_window)
+    if (conn->conn_bytes_in_flight >= conn->conn_send_window) {
       break;
+    }
 
     uint32_t chunk_len = avail < MAX_FRAME_BODY ? avail : MAX_FRAME_BODY;
 
@@ -1124,6 +1128,28 @@ static int send_stream_data(struct reliable_conn *conn,
 /* ------------------------------------------------------------------ */
 /*  Send a STREAM_CLOSE frame for a stream                            */
 /* ------------------------------------------------------------------ */
+static int send_stream_open_frame(struct reliable_conn *conn, uint16_t stream_id,
+                                   uint8_t reliable, uint8_t ordered, uint8_t priority)
+{
+  uint8_t frame[MAX_DATAGRAM_SIZE];
+  int hdr_sz = build_header(frame, FRAME_TYPE_STREAM_OPEN, stream_id, 0);
+  if (hdr_sz < 0) return -1;
+
+  struct frame_stream_open open;
+  open.stream_id = stream_id;
+  open.reliable = reliable;
+  open.ordered = ordered;
+  open.priority = priority;
+  int body_sz = frame_serialize_stream_open_body(frame + FRAME_HEADER_SIZE, &open);
+  if (body_sz < 0) return -1;
+
+  uint16_t frame_len = FRAME_HEADER_SIZE + (uint16_t)body_sz;
+  struct frame_builder fb;
+  fb_init(&fb);
+  if (fb_add(&fb, frame, frame_len) != 0) return -1;
+  return fb_send(&fb, conn);
+}
+
 static int send_stream_close_frame(struct reliable_stream *stream)
 {
   struct reliable_conn *conn = stream->conn;
@@ -1235,8 +1261,9 @@ void reliable_conn_destroy(struct reliable_conn *conn)
 void reliable_conn_set_peer(struct reliable_conn *conn,
                              const struct sockaddr_in *addr)
 {
-  if (conn && addr)
+  if (conn && addr) {
     memcpy(&conn->peer_addr, addr, sizeof(conn->peer_addr));
+  }
 }
 
 struct reliable_stream* reliable_stream_open(struct reliable_conn *conn,
@@ -1276,6 +1303,7 @@ struct reliable_stream* reliable_stream_open(struct reliable_conn *conn,
   stream->state = STREAM_OPEN;
   stream->sent_close_frame = 0;
   stream->remote_closed = 0;
+  stream->pending_open = 1;
   stream->conn = conn;
 
   stream->next_stream_seq_send = 1;
@@ -1443,6 +1471,19 @@ int reliable_conn_tick(struct reliable_conn *conn, uint32_t now_ms)
       if (fb_send(&fb, conn) < 0) return -1;
       fb_init(&fb);
       if (fb_add(&fb, frame, frame_len) != 0) return -1;
+    }
+  }
+
+  /* 1b. Send pending STREAM_OPEN frames */
+  {
+    struct reliable_stream *so_s = conn->streams;
+    while (so_s) {
+      if (so_s->pending_open) {
+        send_stream_open_frame(conn, so_s->stream_id, so_s->reliable,
+                               so_s->ordered, so_s->priority);
+        so_s->pending_open = 0;
+      }
+      so_s = so_s->next;
     }
   }
 

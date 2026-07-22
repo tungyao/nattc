@@ -42,7 +42,8 @@ static const GUID WINTUN_GUID = {0x12345678, 0x1234, 0x1234, {0x12, 0x34, 0x12, 
 static int client_send_reliable(void *ctx, const void *data, uint32_t len,
                                  const struct sockaddr *addr, socklen_t addrlen) {
     struct client_context *cctx = (struct client_context *)ctx;
-    return sendto(cctx->udp_fd, data, len, 0, addr, addrlen) >= 0 ? 0 : -1;
+    ssize_t sent = sendto(cctx->udp_fd, data, len, 0, addr, addrlen);
+    return (sent < 0) ? -1 : 0;
 }
 
 int client_init(struct client_context *ctx, const char *server_ip, uint16_t server_port,
@@ -109,6 +110,23 @@ int client_init(struct client_context *ctx, const char *server_ip, uint16_t serv
         sock_close(ctx->tun_fd);
         return -1;
     }
+
+#ifndef _WIN32
+    /* Accept packets with local source IP (needed when both peers are on same machine) */
+    {
+        char path[128];
+        snprintf(path, sizeof(path), "/proc/sys/net/ipv4/conf/%s/accept_local", tun_name);
+        FILE *f = fopen(path, "w");
+        if (f) { fprintf(f, "1"); fclose(f); }
+    }
+    /* Disable reverse path filter for same reason */
+    {
+        char path[128];
+        snprintf(path, sizeof(path), "/proc/sys/net/ipv4/conf/%s/rp_filter", tun_name);
+        FILE *f = fopen(path, "w");
+        if (f) { fprintf(f, "2"); fclose(f); }
+    }
+#endif
 
     ctx->udp_fd = create_udp_socket();
     if (ctx->udp_fd < 0) {
@@ -757,13 +775,23 @@ void client_run(struct client_context *ctx) {
                     break;
                 }
                 if (n == 0) break;
+
                 {
                     struct peer_session *rp = ctx->peers;
                     int handled = 0;
                     while (rp) {
                         if (rp->rconn &&
-                            rp->public_addr.sin_addr.s_addr == src_addr.sin_addr.s_addr &&
-                            rp->public_addr.sin_port == src_addr.sin_port) {
+                            rp->state == PEER_STATE_ESTABLISHED &&
+                            rp->rconn->peer_addr.sin_port == src_addr.sin_port) {
+                            /* Update peer address if it changed (e.g., dual-IP, NAT rebind) */
+                            if (rp->rconn->peer_addr.sin_addr.s_addr != src_addr.sin_addr.s_addr) {
+                                char buf[64];
+                                uint32_t a = src_addr.sin_addr.s_addr;
+                                snprintf(buf,64,"%d.%d.%d.%d:%d", (a>>24)&0xFF,(a>>16)&0xFF,(a>>8)&0xFF,a&0xFF,ntohs(src_addr.sin_port));
+
+                                rp->public_addr = src_addr;
+                                reliable_conn_set_peer(rp->rconn, &src_addr);
+                            }
                             if (n >= 2) {
                                 uint16_t magic = ((uint16_t)(uint8_t)buf[0] << 8) | (uint8_t)buf[1];
                                 if (magic == PROTO_MAGIC) {
@@ -772,9 +800,9 @@ void client_run(struct client_context *ctx) {
                                     break;
                                 }
                             }
-                            uint32_t now_ms = reliable_time_ms();
-                            reliable_conn_input(rp->rconn, buf, (uint32_t)n, now_ms);
-                            rp->last_rx_time = time(NULL);
+                             uint32_t now_ms = reliable_time_ms();
+                             reliable_conn_input(rp->rconn, buf, (uint32_t)n, now_ms);
+                             rp->last_rx_time = time(NULL);
                             struct reliable_stream *s = rp->rconn->streams;
                             while (s) {
                                 uint8_t rbuf[RELIABLE_STREAM_RECV_BUF_SIZE];
@@ -798,7 +826,7 @@ void client_run(struct client_context *ctx) {
 
         /* Handle TUN data */
 #ifndef _WIN32
-        if (tun_ready) {
+        {
             for (;;) {
                 char buf[MAX_MSG_SIZE];
                 int n = tun_read(ctx, buf, sizeof(buf));
@@ -842,6 +870,7 @@ void client_run(struct client_context *ctx) {
             while (pt) {
                 if (pt->state == PEER_STATE_ESTABLISHED && pt->rconn) {
                     uint32_t now_ms = reliable_time_ms();
+
                     reliable_conn_tick(pt->rconn, now_ms);
                 }
                 pt = pt->next;
@@ -1230,8 +1259,7 @@ void client_handle_punch_echo(struct client_context *ctx, const struct sockaddr_
             reliable_stream_open(peer->rconn, 0, 0, 2);
         }
     }
-    fprintf(stderr, "*** PUNCH SUCCEEDED with peer %s (session=%u) ***\n",
-            peer->id, peer->session_id);
+
     struct punch_echo our_echo;
     strncpy(our_echo.peer_id, ctx->id, sizeof(our_echo.peer_id) - 1);
     our_echo.peer_id[sizeof(our_echo.peer_id) - 1] = '\0';
@@ -1245,47 +1273,55 @@ void client_handle_punch_ack(struct client_context *ctx, const struct punch_ack 
     printf("Punch ACK received, session=%u\n", ack_session);
     struct peer_session *peer = ctx->peers;
     while (peer) {
-        if (peer->state == PEER_STATE_PUNCHING || peer->state == PEER_STATE_RESETTING) {
-            if (ack_session > peer->session_id) peer->session_id = ack_session;
-            peer->state = PEER_STATE_ESTABLISHED;
-            peer->last_rx_time = time(NULL);
-            peer->punch_attempts = 0;
-            peer->lan_phase = LAN_PHASE_NONE;
-            ctx->punch_failures = 0;
-            if (!peer->rconn) {
-                peer->rconn = reliable_conn_create(peer->session_id, client_send_reliable, ctx);
-                if (peer->rconn) {
-                    reliable_conn_set_peer(peer->rconn, &peer->public_addr);
-                    reliable_stream_open(peer->rconn, 1, 1, 0);
-                    reliable_stream_open(peer->rconn, 0, 0, 2);
-                }
-            }
-            fprintf(stderr, "*** PUNCH ACK — session established with %s (session=%u) ***\n",
-                    peer->id, peer->session_id);
-            struct punch_echo our_echo;
-            strncpy(our_echo.peer_id, ctx->id, sizeof(our_echo.peer_id) - 1);
-            our_echo.peer_id[sizeof(our_echo.peer_id) - 1] = '\0';
-            our_echo.session_id = htonl(peer->session_id);
-            send_msg(ctx->udp_fd, &peer->public_addr, MSG_PUNCH_ECHO, 0, &our_echo, sizeof(our_echo));
-            printf("Sent post-ACK echo to %s with session=%u\n", peer->id, peer->session_id);
-            return;
-        }
+        if ((peer->state == PEER_STATE_PUNCHING || peer->state == PEER_STATE_RESETTING) &&
+            peer->session_id == ack_session)
+            goto found;
         peer = peer->next;
     }
-    printf("Punch ACK: no peer in punching state\n");
+    peer = ctx->peers;
+    while (peer) {
+        if ((peer->state == PEER_STATE_PUNCHING || peer->state == PEER_STATE_RESETTING) &&
+            ack_session > peer->session_id)
+            goto found;
+        peer = peer->next;
+    }
+    printf("Punch ACK: no matching peer in punching state (session=%u)\n", ack_session);
+    return;
+found:
+    if (ack_session > peer->session_id) peer->session_id = ack_session;
+    peer->state = PEER_STATE_ESTABLISHED;
+    peer->last_rx_time = time(NULL);
+    peer->punch_attempts = 0;
+    peer->lan_phase = LAN_PHASE_NONE;
+    ctx->punch_failures = 0;
+    if (!peer->rconn) {
+        peer->rconn = reliable_conn_create(peer->session_id, client_send_reliable, ctx);
+        if (peer->rconn) {
+            peer->rconn->is_initiator = 1;
+            reliable_conn_set_peer(peer->rconn, &peer->public_addr);
+            reliable_stream_open(peer->rconn, 1, 1, 0);
+            reliable_stream_open(peer->rconn, 0, 0, 2);
+        }
+    }
+
+    struct punch_echo our_echo;
+    strncpy(our_echo.peer_id, ctx->id, sizeof(our_echo.peer_id) - 1);
+    our_echo.peer_id[sizeof(our_echo.peer_id) - 1] = '\0';
+    our_echo.session_id = htonl(peer->session_id);
+    send_msg(ctx->udp_fd, &peer->public_addr, MSG_PUNCH_ECHO, 0, &our_echo, sizeof(our_echo));
+    printf("Sent post-ACK echo to %s with session=%u\n", peer->id, peer->session_id);
 }
 
 void client_handle_p2p_data(struct client_context *ctx, const struct sockaddr_in *src_addr,
                             const struct p2p_data_header *hdr, const void *data, uint32_t data_len) {
     uint32_t session_id = ntohl(hdr->session_id);
     uint32_t seq = ntohl(hdr->seq);
-
     struct peer_session *peer = ctx->peers;
     while (peer) {
         if (peer->session_id == session_id && peer->state == PEER_STATE_ESTABLISHED) break;
         peer = peer->next;
     }
-    if (!peer) { fprintf(stderr, "P2P data for unknown session %u\n", session_id); return; }
+    if (!peer) { return; }
     if (seq == peer->rx_seq && peer->rx_seq != 0) return;
     if (seq > peer->rx_seq) peer->rx_seq = seq;
     peer->last_rx_time = time(NULL);
@@ -1297,10 +1333,7 @@ void client_handle_p2p_data(struct client_context *ctx, const struct sockaddr_in
         peer->public_addr = *src_addr;
     }
 
-    int written = tun_write(ctx, data, data_len);
-    if (written < 0) {
-        fprintf(stderr, "write TUN failed: %s\n", sock_strerror());
-    }
+    tun_write(ctx, data, data_len);
 }
 
 void client_handle_heartbeat_resp(struct client_context *ctx, const struct heartbeat_resp *resp) {
@@ -1389,8 +1422,7 @@ void client_update_punch_state(struct client_context *ctx, struct peer_session *
         }
         if ((now - peer->last_rx_time) > PUNCH_TIMEOUT_SEC) {
             ctx->punch_failures++;
-            fprintf(stderr, "*** PUNCH TIMEOUT for peer %s after %d attempts (total failures: %d) ***\n",
-                    peer->id, peer->punch_attempts, ctx->punch_failures);
+
             peer->state = PEER_STATE_IDLE;
 
             if (ctx->punch_failures >= PUNCH_REBIND_THRESHOLD) {
@@ -1419,14 +1451,14 @@ void client_update_punch_state(struct client_context *ctx, struct peer_session *
 
 void client_send_p2p_data(struct client_context *ctx, struct peer_session *peer, const void *data, uint32_t len) {
     if (peer->state != PEER_STATE_ESTABLISHED) {
-        fprintf(stderr, "Cannot send to %s: not established\n", peer->id);
         return;
     }
 
     if (peer->rconn) {
         struct reliable_stream *s = peer->rconn->streams;
+        uint16_t data_stream_id = peer->rconn->is_initiator ? 1 : 2;
         while (s) {
-            if (s->stream_id == 1) break;
+            if (s->stream_id == data_stream_id) break;
             s = s->next;
         }
         if (s) {
@@ -1508,14 +1540,11 @@ void client_process_tun_packet(struct client_context *ctx, const void *packet, u
                 tun_write(ctx, packet, len);
                 return;
             }
-            fprintf(stderr, "TUN: *** No ARP entry for %s ***\n", dst_str);
             return;
         }
         struct peer_session *peer = peer_find(ctx, arp->peer_id);
-        if (!peer) { fprintf(stderr, "TUN: No peer session for %s\n", arp->peer_id); return; }
+        if (!peer) { return; }
         if (peer->state != PEER_STATE_ESTABLISHED) {
-            fprintf(stderr, "TUN: *** Peer %s state=%d (need %d=ESTABLISHED) — DROPPING packet ***\n",
-                    peer->id, peer->state, PEER_STATE_ESTABLISHED);
             return;
         }
         client_send_p2p_data(ctx, peer, packet, len);

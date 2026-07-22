@@ -102,6 +102,7 @@ struct reliable_stream {
   enum stream_state state;
   uint8_t sent_close_frame;
   uint8_t remote_closed;
+  uint8_t pending_open;
 
   struct reliable_conn *conn;
 
