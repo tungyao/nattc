@@ -20,7 +20,7 @@
 #define RELIABLE_STREAM_RECV_BUF_SIZE (64 * 1024)
 
 /* Maximum number of in-flight (sent but un-acked) packets */
-#define MAX_INFLIGHT 256
+#define MAX_INFLIGHT 65535
 
 /* Maximum number of streams per connection */
 #define MAX_STREAMS 64
@@ -73,7 +73,7 @@ struct inflight_entry {
   uint8_t reliable;
   uint8_t valid;
   uint8_t acked;
-  uint8_t payload[MAX_DATAGRAM_SIZE];
+  uint8_t *payload;
 };
 
 /* Receive-side state for ACK generation */
@@ -145,7 +145,7 @@ struct reliable_conn {
   uint32_t next_packet_seq;
 
   /* In-flight packet tracking */
-  struct inflight_entry inflight[MAX_INFLIGHT];
+  struct inflight_entry *inflight;
 
   /* Receive-side ACK tracking */
   struct ack_tracker ack_tx; /* what we've received from peer */

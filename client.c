@@ -441,7 +441,7 @@ int tun_write(struct client_context *ctx, const void *data, uint32_t len) {
                     ctx->tun_fd, len,
                     ((const uint8_t*)data)[0], ((const uint8_t*)data)[1],
                     ((const uint8_t*)data)[2], ((const uint8_t*)data)[3],
-                    ctx->tun_fd, fcntl(ctx->tun_fd, F_GETFD));
+                    ctx->tun_fd, fcntl(ctx->tun_fd, F_GETFL));
         } else {
             perror("write TUN");
         }
@@ -822,16 +822,8 @@ void client_run(struct client_context *ctx) {
                     while (rp) {
                         if (rp->rconn &&
                             rp->state == PEER_STATE_ESTABLISHED &&
-                            rp->rconn->peer_addr.sin_port == src_addr.sin_port) {
-                            /* Update peer address if it changed (e.g., dual-IP, NAT rebind) */
-                            if (rp->rconn->peer_addr.sin_addr.s_addr != src_addr.sin_addr.s_addr) {
-                                char buf[64];
-                                uint32_t a = src_addr.sin_addr.s_addr;
-                                snprintf(buf,64,"%d.%d.%d.%d:%d", (a>>24)&0xFF,(a>>16)&0xFF,(a>>8)&0xFF,a&0xFF,ntohs(src_addr.sin_port));
-
-                                rp->public_addr = src_addr;
-                                reliable_conn_set_peer(rp->rconn, &src_addr);
-                            }
+                            rp->rconn->peer_addr.sin_port == src_addr.sin_port &&
+                            rp->rconn->peer_addr.sin_addr.s_addr == src_addr.sin_addr.s_addr) {
                             if (n >= 2) {
                                 uint16_t magic = ((uint16_t)(uint8_t)buf[0] << 8) | (uint8_t)buf[1];
                                 if (magic == PROTO_MAGIC) {
@@ -1599,11 +1591,7 @@ void client_process_tun_packet(struct client_context *ctx, const void *packet, u
         client_send_p2p_data(ctx, peer, packet, len);
         return;
     }
-    /* Non-IPv4 packet: check if it looks like an Ethernet frame (TAP mode) with ARP */
-    /* Ethernet frames: dstMAC(6)+srcMAC(6)+EtherType(2), ARP EtherType=0x0806 */
-    if (len >= 42 && pkt[12] == 0x08 && pkt[13] == 0x06) {
-        client_send_arp_reply(ctx, packet, len);
-    }
+    /* Non-IPv4 packet: silently drop (TUN mode only supports IP, not Ethernet/ARP) */
 }
 
 /* ============ ARP proxy ============ */

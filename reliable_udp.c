@@ -74,12 +74,20 @@ static int build_header(uint8_t *buf, uint8_t type, uint16_t stream_id, uint8_t 
 static struct inflight_entry* inflight_lookup(struct reliable_conn *conn,
                                                uint32_t packet_seq)
 {
-  for (int i = 0; i < MAX_INFLIGHT; i++) {
-    struct inflight_entry *e = &conn->inflight[i];
-    if (e->valid && e->packet_seq == packet_seq)
-      return e;
-  }
+  uint32_t idx = packet_seq % MAX_INFLIGHT;
+  struct inflight_entry *e = &conn->inflight[idx];
+  if (e->valid && e->packet_seq == packet_seq)
+    return e;
   return NULL;
+}
+
+/* Free an inflight entry's dynamically allocated payload */
+static void inflight_free_payload(struct inflight_entry *e)
+{
+  if (e->payload) {
+    free(e->payload);
+    e->payload = NULL;
+  }
 }
 
 static struct inflight_entry* inflight_insert(struct reliable_conn *conn,
@@ -89,31 +97,25 @@ static struct inflight_entry* inflight_insert(struct reliable_conn *conn,
   uint32_t idx = packet_seq % MAX_INFLIGHT;
   struct inflight_entry *first = &conn->inflight[idx];
   if (!first->valid || first->acked) {
+    inflight_free_payload(first);
     memset(first, 0, sizeof(*first));
     return first;
   }
 
   /* Fallback: reuse acked or invalid slots */
-  struct inflight_entry *candidate = NULL;
-  uint32_t oldest_time = (uint32_t)-1;
-
   for (int i = 0; i < MAX_INFLIGHT; i++) {
     struct inflight_entry *e = &conn->inflight[i];
-    if (!e->valid)
+    if (!e->valid) {
+      inflight_free_payload(e);
       return memset(e, 0, sizeof(*e)), e;
-    if (e->acked)
+    }
+    if (e->acked) {
+      inflight_free_payload(e);
       return memset(e, 0, sizeof(*e)), e;
-    if (e->send_time_ms < oldest_time) {
-      oldest_time = e->send_time_ms;
-      candidate = e;
     }
   }
 
-  /* Evict oldest */
-  if (candidate) {
-    memset(candidate, 0, sizeof(*candidate));
-    return candidate;
-  }
+  /* All slots full — sender must wait for ACKs */
   return NULL;
 }
 
@@ -122,8 +124,10 @@ static void inflight_clear_stream(struct reliable_conn *conn, uint16_t stream_id
 {
   for (int i = 0; i < MAX_INFLIGHT; i++) {
     struct inflight_entry *e = &conn->inflight[i];
-    if (e->valid && e->stream_id == stream_id)
+    if (e->valid && e->stream_id == stream_id) {
+      inflight_free_payload(e);
       e->valid = 0;
+    }
   }
 }
 
@@ -1104,27 +1108,33 @@ static int send_stream_data(struct reliable_conn *conn,
              stream->send_buf, chunk_len - first);
     }
 
+    uint16_t frame_len = (uint16_t)(FRAME_HEADER_SIZE + body_off + chunk_len);
+
+    /* Track in inflight table — reserve slot BEFORE advancing tail/seq */
+    struct inflight_entry *ie = inflight_insert(conn, packet_seq);
+    if (!ie) {
+      stream->next_stream_seq_send--;
+      break;
+    }
+
+    ie->packet_seq = packet_seq;
+    ie->stream_seq = fd.stream_seq;
+    ie->payload_len = (uint16_t)chunk_len;
+    ie->send_time_ms = now_ms;
+    ie->retransmits = 0;
+    ie->stream_id = stream->stream_id;
+    ie->reliable = stream->reliable;
+    ie->valid = 1;
+    ie->acked = 0;
+    if (chunk_len > 0 && ie->reliable) {
+      ie->payload = (uint8_t*)malloc(chunk_len);
+      if (ie->payload)
+        memcpy(ie->payload, frame + FRAME_HEADER_SIZE + body_off, chunk_len);
+    }
+
     stream->total_bytes_sent += chunk_len;
     stream->send_buf_tail += chunk_len;
     avail -= chunk_len;
-
-    uint16_t frame_len = (uint16_t)(FRAME_HEADER_SIZE + body_off + chunk_len);
-
-    /* Track in inflight table */
-    struct inflight_entry *ie = inflight_insert(conn, packet_seq);
-    if (ie) {
-      ie->packet_seq = packet_seq;
-      ie->stream_seq = fd.stream_seq;
-      ie->payload_len = (uint16_t)chunk_len;
-      ie->send_time_ms = now_ms;
-      ie->retransmits = 0;
-      ie->stream_id = stream->stream_id;
-      ie->reliable = stream->reliable;
-      ie->valid = 1;
-      ie->acked = 0;
-      if (chunk_len > 0 && ie->reliable)
-        memcpy(ie->payload, frame + FRAME_HEADER_SIZE + body_off, chunk_len);
-    }
 
     conn->packets_sent++;
     conn->bytes_sent += chunk_len;
@@ -1268,6 +1278,12 @@ struct reliable_conn* reliable_conn_create(uint32_t session_id,
   conn->next_send_time_ms = 0;
   conn->pacing_interval_us = 0;
 
+  conn->inflight = (struct inflight_entry*)calloc(MAX_INFLIGHT, sizeof(struct inflight_entry));
+  if (!conn->inflight) {
+    free(conn);
+    return NULL;
+  }
+
   rtt_init(&conn->rtt);
   ack_tracker_init(&conn->ack_tx);
 
@@ -1293,6 +1309,10 @@ struct reliable_conn* reliable_conn_create(uint32_t session_id,
 void reliable_conn_destroy(struct reliable_conn *conn)
 {
   if (!conn) return;
+
+  /* Free inflight table */
+  free(conn->inflight);
+  conn->inflight = NULL;
 
   /* Free all streams */
   struct reliable_stream *s = conn->streams;
@@ -1509,11 +1529,27 @@ int reliable_conn_tick(struct reliable_conn *conn, uint32_t now_ms)
 
     uint16_t frame_len = FRAME_HEADER_SIZE + body_off + e->payload_len;
 
-    /* Update inflight entry */
-    e->packet_seq = new_seq;
-    e->send_time_ms = now_ms;
-    e->acked = 0;
-    e->dup_ack_count = 0;
+    /* Move inflight entry to correct slot for new sequence number */
+    uint32_t new_idx = new_seq % MAX_INFLIGHT;
+    struct inflight_entry *new_slot = &conn->inflight[new_idx];
+    if ((uint32_t)i != new_idx) {
+      if (new_slot->valid && !new_slot->acked) {
+        conn->next_packet_seq--;
+        continue;
+      }
+      inflight_free_payload(new_slot);
+      *new_slot = *e;
+      memset(e, 0, sizeof(*e));
+      new_slot->packet_seq = new_seq;
+      new_slot->send_time_ms = now_ms;
+      new_slot->acked = 0;
+      new_slot->dup_ack_count = 0;
+    } else {
+      e->packet_seq = new_seq;
+      e->send_time_ms = now_ms;
+      e->acked = 0;
+      e->dup_ack_count = 0;
+    }
 
     if (fb_add(&fb, frame, frame_len) != 0) {
       if (fb_send(&fb, conn) < 0) return -1;

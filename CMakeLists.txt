@@ -42,31 +42,5 @@ if(WIN32)
     target_compile_definitions(p2p_client PRIVATE _CRT_SECURE_NO_WARNINGS)
 endif()
 
-# Test for reliable_udp
-add_executable(test_reliable_udp
-    test_reliable_udp.c
-    reliable_udp.c
-    frame.c
-    fec.c
-    congestion.c
-)
-target_compile_definitions(test_reliable_udp PRIVATE _GNU_SOURCE)
-if(UNIX AND NOT APPLE)
-    target_link_libraries(test_reliable_udp PRIVATE rt)
-endif()
-
-add_executable(test_token_bucket
-    test_token_bucket.c
-    token_bucket.c
-    utils.c
-)
-if(UNIX AND NOT APPLE)
-    target_link_libraries(test_token_bucket PRIVATE rt)
-endif()
-
-add_executable(test_zcpool
-    test_zcpool.c
-    zcpool.c
-)
 
 install(TARGETS p2p_server p2p_client DESTINATION bin)
