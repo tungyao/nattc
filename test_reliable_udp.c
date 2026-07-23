@@ -1271,9 +1271,9 @@ static void test_fec_adaptive(void)
   assert(fec_adaptive_m(0.0f) == 1);
   assert(fec_adaptive_m(0.005f) == 1);
   assert(fec_adaptive_m(0.01f) == 2);
-  assert(fec_adaptive_m(0.03f) == 2);
-  assert(fec_adaptive_m(0.05f) == 3);
-  assert(fec_adaptive_m(0.1f) == 3);
+  assert(fec_adaptive_m(0.03f) == 3);
+  assert(fec_adaptive_m(0.06f) == 4);
+  assert(fec_adaptive_m(0.10f) == 5);
   PASS();
 }
 
@@ -1288,8 +1288,8 @@ static void test_cubic_slow_start(void)
   struct reliable_conn *conn = setup_conn(&lb, 200);
   struct reliable_stream *s = reliable_stream_open(conn, 1, 1, 0);
   assert(s != NULL);
-  assert(conn->cubic.cwnd == 12000);
-  assert(conn->cubic.ssthresh == 65536);
+  assert(conn->cubic.cwnd == 48000);
+  assert(conn->cubic.ssthresh == 262144);
   assert(conn->cubic.in_recovery == 0);
 
   reliable_stream_send(s, "data", 4);
@@ -1346,7 +1346,7 @@ static void test_cubic_congestion_avoidance(void)
   struct reliable_conn *conn = setup_conn(&lb, 202);
 
   conn->cubic.cwnd = 10000;
-  cubic_on_loss(&conn->cubic, 0);
+  cubic_on_loss(&conn->cubic, 0, 1);
   conn->cubic.ssthresh = 50000;
   conn->cubic.cwnd = conn->cubic.ssthresh;
   conn->cubic.in_recovery = 0;
@@ -1377,17 +1377,20 @@ static void test_delay_reduction(void)
   struct reliable_stream *s = reliable_stream_open(conn, 1, 1, 0);
   assert(s != NULL);
 
-  conn->delay.rtt_threshold = Q16_FROM_MS(10);
+  conn->delay.base_rtt = 1;
   conn->delay.delay_reduced = 0;
+  conn->delay.high_rtt_count = 0;
   uint32_t cwnd_before = conn->cubic.cwnd;
 
-  reliable_stream_send(s, "data", 4);
-  reliable_conn_tick(conn, 100);
-
-  uint8_t dgram[MAX_DATAGRAM_SIZE];
-  uint16_t dgram_len;
-  build_ack_datagram(dgram, &dgram_len, 0, 1);
-  reliable_conn_input(conn, dgram, dgram_len, 200);
+  /* Need 3 consecutive ACKs with inflated RTT to trigger delay reduction */
+  for (int i = 0; i < 3; i++) {
+    reliable_stream_send(s, "data", 4);
+    reliable_conn_tick(conn, (uint32_t)(i * 100 + 100));
+    uint8_t dgram[MAX_DATAGRAM_SIZE];
+    uint16_t dgram_len;
+    build_ack_datagram(dgram, &dgram_len, (uint32_t)(i * 1), (uint32_t)(i + 1));
+    reliable_conn_input(conn, dgram, dgram_len, (uint32_t)(i * 100 + 2000));
+  }
 
   assert(conn->delay.delay_reduced == 1);
   assert(conn->cubic.cwnd < cwnd_before);

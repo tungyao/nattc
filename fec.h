@@ -61,5 +61,6 @@ int fec_decode(struct fec_ctx *ctx, struct fec_packet *packets,
                uint16_t padded_len);
 
 uint8_t fec_adaptive_m(float loss_rate);
+uint8_t fec_adaptive_n(uint32_t smoothed_rtt_ms);
 
 #endif

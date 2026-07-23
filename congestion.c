@@ -42,19 +42,41 @@ void cubic_init(struct cubic_state *cubic, struct delay_monitor *delay, uint32_t
   delay->rtt_threshold = (uint32_t)((uint32_t)(initial_rtt_ms * 3 / 2) << 16);
   delay->delay_reduced = 0;
   delay->last_delay_reduce = 0;
+  delay->high_rtt_count = 0;
+  delay->delay_recovery_count = 0;
 }
 
-void cubic_on_loss(struct cubic_state *cubic, uint32_t now_ms)
+static void cubic_recalc_k(struct cubic_state *cubic)
 {
+  double w_max_seg = (double)cubic->w_max / (double)CUBIC_MSS;
+  double k_sec = cbrt_double(w_max_seg * 0.75);
+  cubic->k_q16 = (uint32_t)(k_sec * 65536.0 + 0.5);
+}
+
+void cubic_on_loss(struct cubic_state *cubic, uint32_t now_ms, int is_congestion_loss)
+{
+  uint32_t reduce_num = is_congestion_loss ? CUBIC_LOSS_REDUCE_NUM : CUBIC_RANDOM_LOSS_REDUCE_NUM;
+  uint32_t reduce_den = is_congestion_loss ? CUBIC_LOSS_REDUCE_DEN : CUBIC_RANDOM_LOSS_REDUCE_DEN;
+
   cubic->w_max = cubic->cwnd;
-  cubic->ssthresh = (uint32_t)((uint64_t)cubic->cwnd * 45875 >> 16);
+  cubic->ssthresh = (uint32_t)((uint64_t)cubic->cwnd * reduce_num / reduce_den);
   if (cubic->ssthresh < CWND_MIN)
     cubic->ssthresh = CWND_MIN;
   cubic->cwnd = cubic->ssthresh;
   cubic->in_recovery = 1;
   cubic->last_loss_time = now_ms;
 
-  double w_max_seg = (double)cubic->w_max / (double)CUBIC_MSS;
-  double k_sec = cbrt_double(w_max_seg * 0.75);
-  cubic->k_q16 = (uint32_t)(k_sec * 65536.0 + 0.5);
+  cubic_recalc_k(cubic);
+}
+
+void cubic_on_delay_reduction(struct cubic_state *cubic, uint32_t now_ms)
+{
+  cubic->w_max = cubic->cwnd;
+  cubic->cwnd = (uint32_t)((uint64_t)cubic->cwnd * DELAY_REDUCE_FACTOR_NUM / DELAY_REDUCE_FACTOR_DEN);
+  if (cubic->cwnd < CWND_MIN)
+    cubic->cwnd = CWND_MIN;
+  cubic->ssthresh = cubic->cwnd;
+  cubic->last_loss_time = now_ms;
+
+  cubic_recalc_k(cubic);
 }

@@ -186,6 +186,10 @@ struct reliable_conn {
   /* Conn tick state */
   uint32_t last_tick_ms;
 
+  /* Packet pacing */
+  uint32_t next_send_time_ms;
+  uint32_t pacing_interval_us;
+
   /* FEC state (Phase 3) */
   uint8_t fec_enabled;
   uint8_t fec_n;

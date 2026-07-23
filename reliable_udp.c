@@ -544,6 +544,14 @@ static void handle_acked_packet(struct reliable_conn *conn,
     conn->bytes_acked_since_last_estimate = 0;
     conn->last_bandwidth_estimate_ms = now_ms;
   }
+
+  if (smoothed_ms > 0 && conn->cubic.cwnd >= CWND_MIN) {
+    uint32_t segs_in_flight = conn->cubic.cwnd / CUBIC_MSS;
+    if (segs_in_flight < 1) segs_in_flight = 1;
+    conn->pacing_interval_us = (smoothed_ms * 1000) / segs_in_flight;
+    if (conn->pacing_interval_us > 50000)
+      conn->pacing_interval_us = 50000;
+  }
 }
 
 static void process_ack_frame(struct reliable_conn *conn,
@@ -599,8 +607,14 @@ static void process_ack_frame(struct reliable_conn *conn,
         e->dup_ack_count++;
         if (e->dup_ack_count >= 3) {
           /* Fast retransmit */
-          if (!conn->cubic.in_recovery)
-            cubic_on_loss(&conn->cubic, now_ms);
+          if (!conn->cubic.in_recovery) {
+            int is_congestion = 1;
+            uint32_t base_rtt = conn->delay.base_rtt;
+            if (conn->rtt.latest_rtt > 0 &&
+                conn->rtt.latest_rtt < (uint32_t)((uint64_t)base_rtt * 12 / 10))
+              is_congestion = 0;
+            cubic_on_loss(&conn->cubic, now_ms, is_congestion);
+          }
           e->retransmits++;
           conn->packets_lost++;
           conn->packets_retransmitted++;
@@ -652,22 +666,32 @@ static void process_ack_frame(struct reliable_conn *conn,
       conn->cubic.in_recovery = 0;
   }
 
-  /* Delay monitor */
+  /* Delay monitor: consecutive-sample threshold instead of instant trigger */
   {
-    uint32_t current_rtt_ms = conn->rtt.latest_rtt;
-    uint32_t current_rtt_q16 = Q16_FROM_MS(current_rtt_ms);
-    if (current_rtt_q16 > conn->delay.rtt_threshold &&
-        !conn->delay.delay_reduced) {
-      conn->cubic.cwnd = (uint32_t)((uint64_t)conn->cubic.cwnd * 55705 >> 16);
-      if (conn->cubic.cwnd < CWND_MIN)
-        conn->cubic.cwnd = CWND_MIN;
-      conn->delay.delay_reduced = 1;
-      conn->delay.last_delay_reduce = now_ms;
+    uint32_t smoothed_rtt_ms = Q16_TO_MS(conn->rtt.smoothed_rtt);
+    uint32_t base_rtt = conn->delay.base_rtt;
+    if (base_rtt == 0) base_rtt = INITIAL_RTT_MS;
+
+    if (!conn->delay.delay_reduced) {
+      uint32_t threshold_ms = (uint32_t)((uint64_t)base_rtt * 15 / 10);
+      if (smoothed_rtt_ms > threshold_ms) {
+        conn->delay.high_rtt_count++;
+        if (conn->delay.high_rtt_count >= DELAY_CONSECUTIVE_THRESHOLD) {
+          cubic_on_delay_reduction(&conn->cubic, now_ms);
+          conn->delay.delay_reduced = 1;
+          conn->delay.last_delay_reduce = now_ms;
+          conn->delay.high_rtt_count = 0;
+        }
+      } else {
+        conn->delay.high_rtt_count = 0;
+      }
     }
     if (conn->delay.delay_reduced) {
-      uint32_t rtt_ms = Q16_TO_MS(conn->rtt.smoothed_rtt);
-      if (now_ms - conn->delay.last_delay_reduce > rtt_ms)
+      conn->delay.delay_recovery_count++;
+      if (conn->delay.delay_recovery_count > DELAY_REDUCE_MULTIPLIER_RTT * 4) {
         conn->delay.delay_reduced = 0;
+        conn->delay.delay_recovery_count = 0;
+      }
     }
   }
 }
@@ -984,7 +1008,7 @@ static int fec_track_recv_packet(struct reliable_conn *conn,
   return 0;
 }
 
-/* Adaptive FEC: adjust M based on loss rate every FEC_ADAPT_INTERVAL packets */
+/* Adaptive FEC: adjust M based on loss rate and N based on RTT */
 static void fec_adaptive_update(struct reliable_conn *conn)
 {
   if (conn->fec_total_counter < FEC_ADAPT_INTERVAL) return;
@@ -994,6 +1018,13 @@ static void fec_adaptive_update(struct reliable_conn *conn)
   if (new_m > FEC_MAX_M) new_m = FEC_MAX_M;
   if (new_m < 1) new_m = 1;
   conn->fec_m = new_m;
+
+  uint32_t smoothed_ms = Q16_TO_MS(conn->rtt.smoothed_rtt);
+  uint8_t new_n = fec_adaptive_n(smoothed_ms);
+  if (new_n > FEC_MAX_N) new_n = FEC_MAX_N;
+  if (new_n < 2) new_n = 2;
+  conn->fec_n = new_n;
+
   conn->fec_loss_counter = 0;
   conn->fec_total_counter = 0;
 }
@@ -1009,7 +1040,14 @@ static int send_stream_data(struct reliable_conn *conn,
   uint32_t avail = stream->send_buf_head - stream->send_buf_tail;
   if (avail == 0) return 0;
 
+  if (conn->pacing_interval_us > 0 && conn->next_send_time_ms > 0 &&
+      (int32_t)(now_ms - conn->next_send_time_ms) < 0)
+    return 0;
+
+  int sent_this_call = 0;
+
   while (avail > 0) {
+    if (sent_this_call > 0 && conn->pacing_interval_us > 0) break;
     /* Check stream-level flow control (absolute byte offset) */
     if (stream->reliable &&
         stream->total_bytes_sent >= stream->flow.send_window) {
@@ -1101,6 +1139,9 @@ static int send_stream_data(struct reliable_conn *conn,
     if (fb_add(fb, frame, frame_len) != 0) {
       /* Datagram full; send what we have, start new builder */
       if (fb_send(fb, conn) < 0) return -1;
+      sent_this_call++;
+      if (conn->pacing_interval_us > 0)
+        conn->next_send_time_ms = now_ms + conn->pacing_interval_us / 1000;
       fb_init(fb);
       if (fb_add(fb, frame, frame_len) != 0) return -1;
     }
@@ -1110,7 +1151,11 @@ static int send_stream_data(struct reliable_conn *conn,
       const uint8_t *pload = frame + FRAME_HEADER_SIZE + body_off;
       if (fec_track_sent_packet(conn, packet_seq, stream->stream_id,
                                  fd.stream_seq, pload, (uint16_t)chunk_len)) {
+        int before_count = sent_this_call;
         if (fec_send_parity(conn, fb, now_ms) != 0) return -1;
+        sent_this_call++;
+        if (sent_this_call > before_count + 1 && conn->pacing_interval_us > 0)
+          conn->next_send_time_ms = now_ms + conn->pacing_interval_us / 1000;
       }
       conn->fec_total_counter++;
       fec_adaptive_update(conn);
@@ -1219,6 +1264,9 @@ struct reliable_conn* reliable_conn_create(uint32_t session_id,
   conn->pending_ack = 0;
   conn->last_ack_send_ms = 0;
   conn->last_tick_ms = 0;
+
+  conn->next_send_time_ms = 0;
+  conn->pacing_interval_us = 0;
 
   rtt_init(&conn->rtt);
   ack_tracker_init(&conn->ack_tx);
@@ -1439,7 +1487,7 @@ int reliable_conn_tick(struct reliable_conn *conn, uint32_t now_ms)
 
     /* Timeout - retransmit */
     if (!conn->cubic.in_recovery)
-      cubic_on_loss(&conn->cubic, now_ms);
+      cubic_on_loss(&conn->cubic, now_ms, 1);
     e->retransmits++;
     conn->packets_lost++;
     conn->packets_retransmitted++;

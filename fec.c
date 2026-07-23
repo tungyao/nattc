@@ -193,6 +193,17 @@ int fec_decode(struct fec_ctx *ctx, struct fec_packet *packets,
 uint8_t fec_adaptive_m(float loss_rate)
 {
   if (loss_rate < 0.01f) return 1;
-  if (loss_rate < 0.05f) return 2;
-  return 3;
+  if (loss_rate < 0.03f) return 2;
+  if (loss_rate < 0.06f) return 3;
+  if (loss_rate < 0.10f) return 4;
+  return 5;
+}
+
+uint8_t fec_adaptive_n(uint32_t smoothed_rtt_ms)
+{
+  if (smoothed_rtt_ms < 30)  return 20;
+  if (smoothed_rtt_ms < 80)  return 15;
+  if (smoothed_rtt_ms < 150) return 10;
+  if (smoothed_rtt_ms < 300) return 8;
+  return 6;
 }
