@@ -679,6 +679,20 @@ void send_ring_drain(struct client_context *ctx) {
                               (struct sockaddr *)&entry->addr,
                               sizeof(entry->addr));
         if (sent < 0) {
+            int se = sock_errno();
+            if (se == EAGAIN
+#ifdef _WIN32
+                || se == WSAEWOULDBLOCK
+#else
+                || se == EWOULDBLOCK
+#endif
+               ) {
+                break;
+            }
+            /* Permanent error: drop entry */
+            zcpool_free(&ctx->zp, entry->buf);
+            ctx->send_queue_head = (ctx->send_queue_head + 1) % SEND_QUEUE_SIZE;
+            ctx->send_queue_count--;
             break;
         }
         zcpool_free(&ctx->zp, entry->buf);
@@ -973,6 +987,8 @@ void client_run(struct client_context *ctx) {
                     ctx->tb.fill_rate = SEND_RATE_MAX_BPS;
             }
             ctx->tb.capacity = ctx->tb.fill_rate * 200 / 1000;
+            if (ctx->tb.tokens > ctx->tb.capacity)
+                ctx->tb.tokens = ctx->tb.capacity;
             ctx->eagain_count = 0;
             ctx->data_sent_epoch = 0;
 

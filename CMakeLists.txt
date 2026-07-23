@@ -60,7 +60,9 @@ add_executable(test_token_bucket
     token_bucket.c
     utils.c
 )
-target_link_libraries(test_token_bucket PRIVATE rt)
+if(UNIX AND NOT APPLE)
+    target_link_libraries(test_token_bucket PRIVATE rt)
+endif()
 
 add_executable(test_zcpool
     test_zcpool.c
