@@ -172,12 +172,16 @@ struct reliable_conn {
   uint32_t packets_lost;
   uint32_t packets_retransmitted;
 
-  /* Congestion control (CUBIC + delay awareness) */
-  struct cubic_state cubic;
-  struct delay_monitor delay;
+  /* Congestion control (Reno AIMD) */
+  struct congestion_state congestion;
   uint32_t bytes_acked_since_last_estimate;
   uint32_t last_bandwidth_estimate_ms;
   uint32_t delivery_rate;
+
+  /* Fast retransmit tracking */
+  uint32_t recovery_end_seq;
+  uint32_t dup_ack_count;
+  uint32_t last_acked_seq;
 
   /* Time-based ACK generation */
   uint32_t last_ack_send_ms;
@@ -185,10 +189,6 @@ struct reliable_conn {
 
   /* Conn tick state */
   uint32_t last_tick_ms;
-
-  /* Packet pacing */
-  uint32_t next_send_time_ms;
-  uint32_t pacing_interval_us;
 
   /* FEC state (Phase 3) */
   uint8_t fec_enabled;
