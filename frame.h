@@ -5,7 +5,7 @@
 #include <stddef.h>
 
 /* Maximum UDP datagram payload */
-#define MAX_DATAGRAM_SIZE 1200
+#define MAX_DATAGRAM_SIZE 1420
 
 /* Protocol version */
 #define FRAME_VERSION 0x01
