@@ -151,6 +151,11 @@ int client_init(struct client_context *ctx, const char *server_ip, uint16_t serv
     token_bucket_init(&ctx->tb, SEND_RATE_INITIAL_BPS);
     zcpool_init(&ctx->zp);
 
+    memset(ctx->send_queue, 0, sizeof(ctx->send_queue));
+    ctx->send_queue_head = 0;
+    ctx->send_queue_tail = 0;
+    ctx->send_queue_count = 0;
+
     {   int snd, rcv;
         set_udp_buf_size(ctx->udp_fd, UDP_BUF_INITIAL, &snd, &rcv);
         ctx->udp_buf_size = snd;
@@ -640,17 +645,47 @@ extern volatile int running;
 /* ============ Send ring buffer (EAGAIN retry) ============ */
 
 int send_ring_enqueue(struct client_context *ctx, const char *data, uint32_t len, const struct sockaddr_in *addr) {
+    if (ctx->send_queue_count >= SEND_QUEUE_SIZE) {
+        /* Drop oldest */
+        struct send_queue_entry *old = &ctx->send_queue[ctx->send_queue_head];
+        if (old->buf) zcpool_free(&ctx->zp, old->buf);
+        ctx->send_queue_head = (ctx->send_queue_head + 1) % SEND_QUEUE_SIZE;
+        ctx->send_queue_count--;
+    }
     struct zcpool_buf *buf = zcpool_alloc(&ctx->zp);
     if (!buf) return -1;
-    buf->offset = 0;
     buf->len = (uint16_t)len;
     memcpy(zcpool_payload(buf), data, len);
-    (void)addr;
+
+    struct send_queue_entry *entry = &ctx->send_queue[ctx->send_queue_tail];
+    entry->buf = buf;
+    entry->addr = *addr;
+    ctx->send_queue_tail = (ctx->send_queue_tail + 1) % SEND_QUEUE_SIZE;
+    ctx->send_queue_count++;
     return 0;
 }
 
 void send_ring_drain(struct client_context *ctx) {
-    (void)ctx;
+    int drained = 0;
+    while (ctx->send_queue_count > 0 && drained < SEND_QUEUE_SIZE) {
+        struct send_queue_entry *entry = &ctx->send_queue[ctx->send_queue_head];
+        if (!entry->buf) {
+            ctx->send_queue_head = (ctx->send_queue_head + 1) % SEND_QUEUE_SIZE;
+            ctx->send_queue_count--;
+            continue;
+        }
+        ssize_t sent = sendto(ctx->udp_fd, zcpool_payload(entry->buf),
+                              entry->buf->len, 0,
+                              (struct sockaddr *)&entry->addr,
+                              sizeof(entry->addr));
+        if (sent < 0) {
+            break;
+        }
+        zcpool_free(&ctx->zp, entry->buf);
+        ctx->send_queue_head = (ctx->send_queue_head + 1) % SEND_QUEUE_SIZE;
+        ctx->send_queue_count--;
+        drained++;
+    }
 }
 
 void client_run(struct client_context *ctx) {
@@ -970,6 +1005,14 @@ void client_run(struct client_context *ctx) {
 }
 
 void client_cleanup(struct client_context *ctx) {
+    /* Drain and free any remaining send queue buffers */
+    while (ctx->send_queue_count > 0) {
+        struct send_queue_entry *entry = &ctx->send_queue[ctx->send_queue_head];
+        if (entry->buf) zcpool_free(&ctx->zp, entry->buf);
+        ctx->send_queue_head = (ctx->send_queue_head + 1) % SEND_QUEUE_SIZE;
+        ctx->send_queue_count--;
+    }
+
     struct peer_session *peer = ctx->peers;
     while (peer) {
         struct peer_session *next = peer->next;

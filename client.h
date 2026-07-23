@@ -36,6 +36,13 @@
 #include "token_bucket.h"
 #include "zcpool.h"
 
+#define SEND_QUEUE_SIZE 64
+
+struct send_queue_entry {
+    struct zcpool_buf *buf;
+    struct sockaddr_in addr;
+};
+
 enum lan_punch_phase {
     LAN_PHASE_NONE = 0,
     LAN_PHASE_LAN,
@@ -81,6 +88,12 @@ struct client_context {
 
     /* Zero-copy buffer pool */
     struct zcpool zp;
+
+    /* Send queue */
+    struct send_queue_entry send_queue[SEND_QUEUE_SIZE];
+    int send_queue_head;
+    int send_queue_tail;
+    int send_queue_count;
 
     xpoll_t *xp;
 
