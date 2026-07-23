@@ -23,7 +23,7 @@ enum reno_state {
   RENO_FAST_RECOVERY
 };
 
-/* Simplified congestion state (replaces cubic_state + delay_monitor) */
+/* Reno AIMD congestion state */
 struct congestion_state {
   enum reno_state state;
   uint32_t cwnd;           /* congestion window in bytes */

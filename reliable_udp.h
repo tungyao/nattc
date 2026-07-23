@@ -34,7 +34,6 @@
 
 /* Default timing constants */
 #define DEFAULT_MAX_ACK_DELAY_MS 25
-#define INITIAL_RTT_MS 200
 #define PING_INTERVAL_MS 1000
 
 /* Stream states */

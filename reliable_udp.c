@@ -1414,14 +1414,19 @@ int reliable_conn_tick(struct reliable_conn *conn, uint32_t now_ms)
   /* 1. Check for retransmission timeouts */
   uint32_t timeout_ms = rtt_compute_timeout_ms(&conn->rtt,
                                                  conn->max_ack_delay_ms);
+  int had_timeout = 0;
   for (int i = 0; i < MAX_INFLIGHT; i++) {
     struct inflight_entry *e = &conn->inflight[i];
     if (!e->valid || e->acked || !e->reliable) continue;
     if (now_ms - e->send_time_ms <= timeout_ms) continue;
 
     /* Timeout - retransmit */
-    if (!conn->cubic.in_recovery)
-      cubic_on_loss(&conn->cubic, now_ms, 1);
+    if (!had_timeout) {
+      reno_on_loss(&conn->congestion, now_ms, 1);
+      conn->recovery_end_seq = conn->next_packet_seq;
+      conn->dup_ack_count = 0;
+      had_timeout = 1;
+    }
     e->retransmits++;
     conn->packets_lost++;
     conn->packets_retransmitted++;
