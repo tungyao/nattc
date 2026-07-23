@@ -509,37 +509,21 @@ static void handle_acked_packet(struct reliable_conn *conn,
 
   e->acked = 1;
 
-  /* Update RTT if this is a first transmission (not retransmit) */
+  /* Update RTT if first transmission (not retransmit) */
   if (e->retransmits == 0) {
     uint32_t sample_ms = now_ms - e->send_time_ms;
     rtt_update(&conn->rtt, sample_ms);
   }
 
-  /* Decrement bytes_in_flight for the stream and connection */
+  /* Decrement bytes_in_flight */
   struct reliable_stream *s = find_stream(conn, e->stream_id);
   if (s && s->flow.bytes_in_flight >= e->payload_len)
     s->flow.bytes_in_flight -= e->payload_len;
   if (conn->conn_bytes_in_flight >= e->payload_len)
     conn->conn_bytes_in_flight -= e->payload_len;
 
-  /* Congestion control: cwnd growth (only if not in recovery) */
-  if (!conn->cubic.in_recovery) {
-    if (conn->cubic.cwnd < conn->cubic.ssthresh) {
-      conn->cubic.cwnd += e->payload_len;
-    } else {
-      double t_sec = (double)(now_ms - conn->cubic.last_loss_time) / 1000.0;
-      double k_sec = (double)conn->cubic.k_q16 / 65536.0;
-      double delta_sec = t_sec - k_sec;
-      if (delta_sec > 0) {
-        double w_cubic_seg = 0.4 * delta_sec * delta_sec * delta_sec
-                           + (double)conn->cubic.w_max / (double)CUBIC_MSS;
-        if (w_cubic_seg < 0) w_cubic_seg = 0;
-        uint32_t w_cubic_bytes = (uint32_t)(w_cubic_seg * CUBIC_MSS + 0.5);
-        if (w_cubic_bytes > conn->cubic.cwnd)
-          conn->cubic.cwnd = w_cubic_bytes;
-      }
-    }
-  }
+  /* Reno congestion window growth */
+  reno_on_ack(&conn->congestion, e->payload_len, packet_seq, conn->recovery_end_seq);
 
   /* Bandwidth estimation */
   conn->bytes_acked_since_last_estimate += e->payload_len;
@@ -548,14 +532,6 @@ static void handle_acked_packet(struct reliable_conn *conn,
     conn->delivery_rate = Q16_DIV(conn->bytes_acked_since_last_estimate, smoothed_ms);
     conn->bytes_acked_since_last_estimate = 0;
     conn->last_bandwidth_estimate_ms = now_ms;
-  }
-
-  if (smoothed_ms > 0 && conn->cubic.cwnd >= CWND_MIN) {
-    uint32_t segs_in_flight = conn->cubic.cwnd / CUBIC_MSS;
-    if (segs_in_flight < 1) segs_in_flight = 1;
-    conn->pacing_interval_us = (smoothed_ms * 1000) / segs_in_flight;
-    if (conn->pacing_interval_us > 50000)
-      conn->pacing_interval_us = 50000;
   }
 }
 
