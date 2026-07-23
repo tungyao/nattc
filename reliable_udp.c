@@ -176,8 +176,9 @@ static uint32_t rtt_compute_timeout_ms(struct rtt_estimator *rtt,
   uint32_t smoothed_ms = Q16_TO_MS(rtt->smoothed_rtt);
   uint32_t variance_ms = Q16_TO_MS(rtt->rtt_variance);
   uint32_t t = smoothed_ms + 4 * variance_ms + max_ack_delay_ms;
-  /* Minimum 10ms timeout */
-  return t < 10 ? 10 : t;
+  if (t < MIN_RTO_MS) t = MIN_RTO_MS;
+  if (t > MAX_RTO_MS) t = MAX_RTO_MS;
+  return t;
 }
 
 /* ------------------------------------------------------------------ */
@@ -1275,9 +1276,6 @@ struct reliable_conn* reliable_conn_create(uint32_t session_id,
   conn->last_ack_send_ms = 0;
   conn->last_tick_ms = 0;
 
-  conn->next_send_time_ms = 0;
-  conn->pacing_interval_us = 0;
-
   conn->inflight = (struct inflight_entry*)calloc(MAX_INFLIGHT, sizeof(struct inflight_entry));
   if (!conn->inflight) {
     free(conn);
@@ -1287,7 +1285,10 @@ struct reliable_conn* reliable_conn_create(uint32_t session_id,
   rtt_init(&conn->rtt);
   ack_tracker_init(&conn->ack_tx);
 
-  cubic_init(&conn->cubic, &conn->delay, INITIAL_RTT_MS);
+  reno_init(&conn->congestion);
+  conn->recovery_end_seq = 0;
+  conn->dup_ack_count = 0;
+  conn->last_acked_seq = 0;
   conn->bytes_acked_since_last_estimate = 0;
   conn->last_bandwidth_estimate_ms = 0;
   conn->delivery_rate = 0;
