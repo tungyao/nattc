@@ -963,14 +963,10 @@ static int send_stream_data(struct reliable_conn *conn,
   uint32_t avail = stream->send_buf_head - stream->send_buf_tail;
   if (avail == 0) return 0;
 
-  if (conn->pacing_interval_us > 0 && conn->next_send_time_ms > 0 &&
-      (int32_t)(now_ms - conn->next_send_time_ms) < 0)
-    return 0;
-
   int sent_this_call = 0;
 
   while (avail > 0) {
-    if (sent_this_call > 0 && conn->pacing_interval_us > 0) break;
+    if (sent_this_call > 0) break;
     /* Check stream-level flow control (absolute byte offset) */
     if (stream->reliable &&
         stream->total_bytes_sent >= stream->flow.send_window) {
@@ -985,11 +981,14 @@ static int send_stream_data(struct reliable_conn *conn,
     uint32_t chunk_len = avail < MAX_FRAME_BODY ? avail : MAX_FRAME_BODY;
 
     /* Congestion control: don't exceed cwnd */
-    if (conn->cubic.cwnd > conn->conn_bytes_in_flight) {
-      uint32_t cwnd_rem = conn->cubic.cwnd - conn->conn_bytes_in_flight;
-      if (chunk_len > cwnd_rem) chunk_len = cwnd_rem;
-    } else {
-      break;
+    {
+      uint32_t cwnd = reno_get_cwnd(&conn->congestion);
+      if (cwnd > conn->conn_bytes_in_flight) {
+        uint32_t cwnd_rem = cwnd - conn->conn_bytes_in_flight;
+        if (chunk_len > cwnd_rem) chunk_len = cwnd_rem;
+      } else {
+        break;
+      }
     }
 
     /* Don't exceed remaining window (absolute offset limit) */
@@ -1069,8 +1068,6 @@ static int send_stream_data(struct reliable_conn *conn,
       /* Datagram full; send what we have, start new builder */
       if (fb_send(fb, conn) < 0) return -1;
       sent_this_call++;
-      if (conn->pacing_interval_us > 0)
-        conn->next_send_time_ms = now_ms + conn->pacing_interval_us / 1000;
       fb_init(fb);
       if (fb_add(fb, frame, frame_len) != 0) return -1;
     }
@@ -1083,8 +1080,6 @@ static int send_stream_data(struct reliable_conn *conn,
         int before_count = sent_this_call;
         if (fec_send_parity(conn, fb, now_ms) != 0) return -1;
         sent_this_call++;
-        if (sent_this_call > before_count + 1 && conn->pacing_interval_us > 0)
-          conn->next_send_time_ms = now_ms + conn->pacing_interval_us / 1000;
       }
       conn->fec_total_counter++;
       fec_adaptive_update(conn);
