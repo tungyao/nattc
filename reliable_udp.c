@@ -540,32 +540,29 @@ static void process_ack_frame(struct reliable_conn *conn,
                                struct ack_range *ranges,
                                uint32_t now_ms)
 {
+  /* Track duplicate ACKs for fast retransmit */
+  if (ack->largest_acked == conn->last_acked_seq && ack->largest_acked > 0) {
+    conn->dup_ack_count++;
+  } else {
+    conn->dup_ack_count = 0;
+    conn->last_acked_seq = ack->largest_acked;
+  }
+
+  /* Process all acked packets */
   uint32_t current = ack->largest_acked;
 
-  /* Build bitmap of acked packets for this ACK */
-  uint8_t acked_bitmap[PACKET_HISTORY_SIZE];
-  memset(acked_bitmap, 0, PACKET_HISTORY_SIZE);
-  uint32_t acked_base = ack->largest_acked;
-
-  /* Process first range (consecutive from largest) */
+  /* First range */
   for (uint16_t i = 0; i < ack->first_ack_range; i++) {
-    uint32_t bit_idx = acked_base - current;
-    if (bit_idx < PACKET_HISTORY_BITS)
-      acked_bitmap[bit_idx >> 3] |= (uint8_t)(1 << (bit_idx & 7));
     handle_acked_packet(conn, current, now_ms);
-    if (current == 0) { current = 0; break; }
+    if (current == 0) break;
     current--;
   }
 
-  /* Process additional ranges */
+  /* Additional ranges */
   for (uint16_t i = 0; i < ack->range_count; i++) {
     if (current < ranges[i].gap) break;
     current -= ranges[i].gap;
-
     for (uint16_t j = 0; j < ranges[i].length; j++) {
-      uint32_t bit_idx = acked_base - current;
-      if (bit_idx < PACKET_HISTORY_BITS)
-        acked_bitmap[bit_idx >> 3] |= (uint8_t)(1 << (bit_idx & 7));
       handle_acked_packet(conn, current, now_ms);
       if (current == 0) break;
       current--;
@@ -573,63 +570,44 @@ static void process_ack_frame(struct reliable_conn *conn,
     if (current == 0) break;
   }
 
-  /* Fast retransmit: increment dup_ack_count for unacked packets < largest_acked */
-  if (ack->largest_acked > 0) {
-    for (int i = 0; i < MAX_INFLIGHT; i++) {
-      struct inflight_entry *e = &conn->inflight[i];
-      if (!e->valid || e->acked || !e->reliable) continue;
-      if (e->packet_seq >= ack->largest_acked) continue;
+  /* Fast retransmit on 3 duplicate ACKs */
+  if (conn->dup_ack_count == 3 && conn->congestion.state != RENO_FAST_RECOVERY) {
+    reno_on_loss(&conn->congestion, now_ms, 0);
+    conn->recovery_end_seq = conn->next_packet_seq;
+    conn->packets_lost++;
 
-      uint32_t bit_idx = acked_base - e->packet_seq;
-      int is_acked = (bit_idx < PACKET_HISTORY_BITS) &&
-                     (acked_bitmap[bit_idx >> 3] & (uint8_t)(1 << (bit_idx & 7)));
+    /* Retransmit the packet just before largest_acked */
+    uint32_t lost_seq = ack->largest_acked - ack->first_ack_range;
+    struct inflight_entry *e = inflight_lookup(conn, lost_seq);
+    if (e && !e->acked && e->reliable) {
+      uint32_t new_seq = conn->next_packet_seq++;
+      uint8_t frame[MAX_DATAGRAM_SIZE];
+      uint8_t retrans_prio = 0;
+      struct reliable_stream *retrans_s = find_stream(conn, e->stream_id);
+      if (retrans_s) retrans_prio = retrans_s->priority;
+      build_header(frame, FRAME_TYPE_DATA, e->stream_id, retrans_prio);
 
-      if (!is_acked) {
-        e->dup_ack_count++;
-        if (e->dup_ack_count >= 3) {
-          /* Fast retransmit */
-          if (!conn->cubic.in_recovery) {
-            int is_congestion = 1;
-            uint32_t base_rtt = conn->delay.base_rtt;
-            if (conn->rtt.latest_rtt > 0 &&
-                conn->rtt.latest_rtt < (uint32_t)((uint64_t)base_rtt * 12 / 10))
-              is_congestion = 0;
-            cubic_on_loss(&conn->cubic, now_ms, is_congestion);
-          }
-          e->retransmits++;
-          conn->packets_lost++;
-          conn->packets_retransmitted++;
-          conn->fec_loss_counter++;
+      struct frame_data fd;
+      fd.packet_seq = new_seq;
+      fd.stream_seq = e->stream_seq;
+      fd.data_len = e->payload_len;
+      int body_off = frame_serialize_data_body(frame + FRAME_HEADER_SIZE, &fd);
+      memcpy(frame + FRAME_HEADER_SIZE + body_off, e->payload, e->payload_len);
 
-          uint32_t new_seq = conn->next_packet_seq++;
-          uint8_t frame[MAX_DATAGRAM_SIZE];
-          uint8_t retrans_prio = 0;
-          struct reliable_stream *retrans_s = find_stream(conn, e->stream_id);
-          if (retrans_s) retrans_prio = retrans_s->priority;
-          build_header(frame, FRAME_TYPE_DATA, e->stream_id, retrans_prio);
+      uint16_t frame_len = FRAME_HEADER_SIZE + body_off + e->payload_len;
 
-          struct frame_data fd;
-          fd.packet_seq = new_seq;
-          fd.stream_seq = e->stream_seq;
-          fd.data_len = e->payload_len;
-          int body_off = frame_serialize_data_body(frame + FRAME_HEADER_SIZE, &fd);
-          memcpy(frame + FRAME_HEADER_SIZE + body_off, e->payload, e->payload_len);
+      e->packet_seq = new_seq;
+      e->send_time_ms = now_ms;
+      e->acked = 0;
+      e->dup_ack_count = 0;
+      e->retransmits++;
 
-          uint16_t frame_len = FRAME_HEADER_SIZE + body_off + e->payload_len;
-
-          e->packet_seq = new_seq;
-          e->send_time_ms = now_ms;
-          e->acked = 0;
-          e->dup_ack_count = 0;
-
-          struct frame_builder rt_fb;
-          fb_init(&rt_fb);
-          if (fb_add(&rt_fb, frame, frame_len) == 0)
-            conn->send_fn(conn->send_ctx, rt_fb.buf, rt_fb.offset,
-                          (const struct sockaddr *)&conn->peer_addr,
-                          sizeof(conn->peer_addr));
-        }
-      }
+      struct frame_builder rt_fb;
+      fb_init(&rt_fb);
+      if (fb_add(&rt_fb, frame, frame_len) == 0)
+        conn->send_fn(conn->send_ctx, rt_fb.buf, rt_fb.offset,
+                      (const struct sockaddr *)&conn->peer_addr,
+                      sizeof(conn->peer_addr));
     }
   }
 
@@ -638,42 +616,6 @@ static void process_ack_frame(struct reliable_conn *conn,
     struct inflight_entry *e = &conn->inflight[i];
     if (e->valid && e->acked)
       e->valid = 0;
-  }
-
-  /* Recovery exit check: clear in_recovery after 1 RTT with no loss */
-  if (conn->cubic.in_recovery) {
-    uint32_t rtt_ms = Q16_TO_MS(conn->rtt.smoothed_rtt);
-    if (now_ms - conn->cubic.last_loss_time > rtt_ms)
-      conn->cubic.in_recovery = 0;
-  }
-
-  /* Delay monitor: consecutive-sample threshold instead of instant trigger */
-  {
-    uint32_t smoothed_rtt_ms = Q16_TO_MS(conn->rtt.smoothed_rtt);
-    uint32_t base_rtt = conn->delay.base_rtt;
-    if (base_rtt == 0) base_rtt = INITIAL_RTT_MS;
-
-    if (!conn->delay.delay_reduced) {
-      uint32_t threshold_ms = (uint32_t)((uint64_t)base_rtt * 15 / 10);
-      if (smoothed_rtt_ms > threshold_ms) {
-        conn->delay.high_rtt_count++;
-        if (conn->delay.high_rtt_count >= DELAY_CONSECUTIVE_THRESHOLD) {
-          cubic_on_delay_reduction(&conn->cubic, now_ms);
-          conn->delay.delay_reduced = 1;
-          conn->delay.last_delay_reduce = now_ms;
-          conn->delay.high_rtt_count = 0;
-        }
-      } else {
-        conn->delay.high_rtt_count = 0;
-      }
-    }
-    if (conn->delay.delay_reduced) {
-      conn->delay.delay_recovery_count++;
-      if (conn->delay.delay_recovery_count > DELAY_REDUCE_MULTIPLIER_RTT * 4) {
-        conn->delay.delay_reduced = 0;
-        conn->delay.delay_recovery_count = 0;
-      }
-    }
   }
 }
 
