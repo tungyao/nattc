@@ -3,45 +3,37 @@
 
 #include <stdint.h>
 
-#define CUBIC_C_Q16 26214
+/* MSS for congestion calculations */
 #define CUBIC_MSS 1200
-#define CWND_INITIAL 48000
-#define CWND_MIN 12000
-#define SSTHRESH_INITIAL 262144
 
-#define DELAY_REDUCE_FACTOR_NUM 58982
-#define DELAY_REDUCE_FACTOR_DEN 65536
-#define DELAY_CONSECUTIVE_THRESHOLD 3
-#define DELAY_REDUCE_MULTIPLIER_RTT 2
+/* Congestion window bounds (in bytes) */
+#define CWND_INITIAL (40 * CUBIC_MSS)   /* 48000 */
+#define CWND_MIN     (10 * CUBIC_MSS)   /* 12000 */
+#define SSTHRESH_INITIAL (220 * CUBIC_MSS) /* 264000 */
 
-#define CUBIC_LOSS_REDUCE_NUM 45875
-#define CUBIC_LOSS_REDUCE_DEN 65536
-#define CUBIC_RANDOM_LOSS_REDUCE_NUM 58982
-#define CUBIC_RANDOM_LOSS_REDUCE_DEN 65536
+/* RTT constants */
+#define INITIAL_RTT_MS 10
+#define MIN_RTO_MS 50
+#define MAX_RTO_MS 2000
 
-struct cubic_state {
-  uint32_t cwnd;
-  uint32_t ssthresh;
-  uint32_t w_max;
-  uint32_t k_q16;
-  uint32_t last_loss_time;
-  uint32_t cubic_c;
-  uint8_t  in_recovery;
+/* Reno congestion control states */
+enum reno_state {
+  RENO_SLOW_START,
+  RENO_CONGESTION_AVOIDANCE,
+  RENO_FAST_RECOVERY
 };
 
-struct delay_monitor {
-  uint32_t base_rtt;
-  uint32_t current_rtt;
-  uint32_t rtt_threshold;
-  uint8_t  delay_reduced;
-  uint32_t last_delay_reduce;
-  uint8_t  high_rtt_count;
-  uint8_t  delay_recovery_count;
+/* Simplified congestion state (replaces cubic_state + delay_monitor) */
+struct congestion_state {
+  enum reno_state state;
+  uint32_t cwnd;           /* congestion window in bytes */
+  uint32_t ssthresh;       /* slow start threshold in bytes */
+  uint32_t last_loss_time; /* timestamp of last loss event */
 };
 
-uint32_t cbrt_fp(uint32_t x);
-void cubic_init(struct cubic_state *cubic, struct delay_monitor *delay, uint32_t initial_rtt_ms);
-void cubic_on_loss(struct cubic_state *cubic, uint32_t now_ms, int is_congestion_loss);
-void cubic_on_delay_reduction(struct cubic_state *cubic, uint32_t now_ms);
+void reno_init(struct congestion_state *cs);
+void reno_on_loss(struct congestion_state *cs, uint32_t now_ms, int is_timeout);
+void reno_on_ack(struct congestion_state *cs, uint32_t bytes_acked, uint32_t largest_acked, uint32_t recovery_end_seq);
+uint32_t reno_get_cwnd(struct congestion_state *cs);
 
-#endif
+#endif /* CONGESTION_H */

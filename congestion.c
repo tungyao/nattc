@@ -1,82 +1,53 @@
 #include "congestion.h"
 
-uint32_t cbrt_fp(uint32_t x)
+void reno_init(struct congestion_state *cs)
 {
-  if (x == 0) return 0;
-  uint32_t y = x >> 5;
-  if (y == 0) y = 1;
-  for (int i = 0; i < 4; i++) {
-    if (y == 0) { y = 1; break; }
-    y = (uint32_t)((2 * (uint64_t)y + x / ((uint64_t)y * y)) / 3);
+  cs->state = RENO_SLOW_START;
+  cs->cwnd = CWND_INITIAL;
+  cs->ssthresh = SSTHRESH_INITIAL;
+  cs->last_loss_time = 0;
+}
+
+void reno_on_loss(struct congestion_state *cs, uint32_t now_ms, int is_timeout)
+{
+  cs->ssthresh = cs->cwnd / 2;
+  if (cs->ssthresh < CWND_MIN)
+    cs->ssthresh = CWND_MIN;
+
+  if (is_timeout) {
+    cs->cwnd = CWND_INITIAL;
+    cs->state = RENO_SLOW_START;
+  } else {
+    cs->cwnd = cs->ssthresh;
+    cs->state = RENO_FAST_RECOVERY;
   }
-  return y;
+
+  cs->last_loss_time = now_ms;
 }
 
-static double cbrt_double(double x)
+void reno_on_ack(struct congestion_state *cs, uint32_t bytes_acked,
+                 uint32_t largest_acked, uint32_t recovery_end_seq)
 {
-  if (x == 0.0) return 0.0;
-  double y = x / 3.0;
-  for (int i = 0; i < 20; i++) {
-    double y2 = y * y;
-    double y_next = (2.0 * y + x / y2) / 3.0;
-    double diff = y_next - y;
-    if (diff < 0) diff = -diff;
-    if (diff < 1e-12 * y) break;
-    y = y_next;
+  if (cs->state == RENO_FAST_RECOVERY) {
+    if (largest_acked >= recovery_end_seq) {
+      cs->cwnd = cs->ssthresh;
+      cs->state = RENO_CONGESTION_AVOIDANCE;
+    }
+    return;
   }
-  return y;
+
+  if (cs->state == RENO_SLOW_START) {
+    cs->cwnd += bytes_acked;
+    if (cs->cwnd >= cs->ssthresh)
+      cs->state = RENO_CONGESTION_AVOIDANCE;
+  } else {
+    uint32_t increase = (uint32_t)((uint64_t)CUBIC_MSS * bytes_acked / cs->cwnd);
+    if (increase == 0) increase = 1;
+    cs->cwnd += increase;
+  }
 }
 
-void cubic_init(struct cubic_state *cubic, struct delay_monitor *delay, uint32_t initial_rtt_ms)
+uint32_t reno_get_cwnd(struct congestion_state *cs)
 {
-  cubic->cwnd = CWND_INITIAL;
-  cubic->ssthresh = SSTHRESH_INITIAL;
-  cubic->w_max = 0;
-  cubic->k_q16 = 0;
-  cubic->last_loss_time = 0;
-  cubic->cubic_c = CUBIC_C_Q16;
-  cubic->in_recovery = 0;
-
-  delay->base_rtt = initial_rtt_ms;
-  delay->current_rtt = 0;
-  delay->rtt_threshold = (uint32_t)((uint32_t)(initial_rtt_ms * 3 / 2) << 16);
-  delay->delay_reduced = 0;
-  delay->last_delay_reduce = 0;
-  delay->high_rtt_count = 0;
-  delay->delay_recovery_count = 0;
-}
-
-static void cubic_recalc_k(struct cubic_state *cubic)
-{
-  double w_max_seg = (double)cubic->w_max / (double)CUBIC_MSS;
-  double k_sec = cbrt_double(w_max_seg * 0.75);
-  cubic->k_q16 = (uint32_t)(k_sec * 65536.0 + 0.5);
-}
-
-void cubic_on_loss(struct cubic_state *cubic, uint32_t now_ms, int is_congestion_loss)
-{
-  uint32_t reduce_num = is_congestion_loss ? CUBIC_LOSS_REDUCE_NUM : CUBIC_RANDOM_LOSS_REDUCE_NUM;
-  uint32_t reduce_den = is_congestion_loss ? CUBIC_LOSS_REDUCE_DEN : CUBIC_RANDOM_LOSS_REDUCE_DEN;
-
-  cubic->w_max = cubic->cwnd;
-  cubic->ssthresh = (uint32_t)((uint64_t)cubic->cwnd * reduce_num / reduce_den);
-  if (cubic->ssthresh < CWND_MIN)
-    cubic->ssthresh = CWND_MIN;
-  cubic->cwnd = cubic->ssthresh;
-  cubic->in_recovery = 1;
-  cubic->last_loss_time = now_ms;
-
-  cubic_recalc_k(cubic);
-}
-
-void cubic_on_delay_reduction(struct cubic_state *cubic, uint32_t now_ms)
-{
-  cubic->w_max = cubic->cwnd;
-  cubic->cwnd = (uint32_t)((uint64_t)cubic->cwnd * DELAY_REDUCE_FACTOR_NUM / DELAY_REDUCE_FACTOR_DEN);
-  if (cubic->cwnd < CWND_MIN)
-    cubic->cwnd = CWND_MIN;
-  cubic->ssthresh = cubic->cwnd;
-  cubic->last_loss_time = now_ms;
-
-  cubic_recalc_k(cubic);
+  return cs->cwnd;
 }
