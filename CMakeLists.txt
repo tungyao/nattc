@@ -5,7 +5,7 @@ set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 
 # Common sources
-set(COMMON_SOURCES utils.c xpoll.c iocp.c)
+set(COMMON_SOURCES utils.c xpoll.c iocp.c token_bucket.c zcpool.c)
 
 # Reliable UDP sources
 set(RELIABLE_SOURCES reliable_udp.c frame.c fec.c congestion.c)
