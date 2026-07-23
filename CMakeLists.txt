@@ -55,4 +55,16 @@ if(UNIX AND NOT APPLE)
     target_link_libraries(test_reliable_udp PRIVATE rt)
 endif()
 
+add_executable(test_token_bucket
+    test_token_bucket.c
+    token_bucket.c
+    utils.c
+)
+target_link_libraries(test_token_bucket PRIVATE rt)
+
+add_executable(test_zcpool
+    test_zcpool.c
+    zcpool.c
+)
+
 install(TARGETS p2p_server p2p_client DESTINATION bin)
