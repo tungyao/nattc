@@ -148,7 +148,6 @@ int client_init(struct client_context *ctx, const char *server_ip, uint16_t serv
     ctx->eagain_count = 0;
     ctx->last_buf_check = 0;
     ctx->data_sent_epoch = 0;
-    token_bucket_init(&ctx->tb, SEND_RATE_INITIAL_BPS);
     zcpool_init(&ctx->zp);
 
     memset(ctx->send_queue, 0, sizeof(ctx->send_queue));
@@ -953,12 +952,8 @@ void client_run(struct client_context *ctx) {
             /* Drain send ring (retry EAGAIN-failed packets) */
             send_ring_drain(ctx);
 
-            /* Token bucket rate adaptation + buffer auto-grow */
+            /* UDP buffer auto-grow on EAGAIN */
             if (ctx->eagain_count > 0) {
-                ctx->tb.fill_rate /= 2;
-                if (ctx->tb.fill_rate < SEND_RATE_MIN_BPS)
-                    ctx->tb.fill_rate = SEND_RATE_MIN_BPS;
-
                 if (now - ctx->last_buf_check >= UDP_BUF_CHECK_INTERVAL) {
                     int target = ctx->udp_buf_size * UDP_BUF_GROW_FACTOR;
                     if (target > UDP_BUF_MAX) target = UDP_BUF_MAX;
@@ -967,20 +962,12 @@ void client_run(struct client_context *ctx) {
                         set_udp_buf_size(ctx->udp_fd, target, &snd, &rcv);
                         int old = ctx->udp_buf_size;
                         ctx->udp_buf_size = snd;
-                        printf("UDP buffer grown: %dKB -> %dKB (recv=%dKB, rate=%.1f MB/s)\n",
-                               old / 1024, snd / 1024, rcv / 1024,
-                               ctx->tb.fill_rate / (1024.0 * 1024.0));
+                        printf("UDP buffer grown: %dKB -> %dKB (recv=%dKB)\n",
+                               old / 1024, snd / 1024, rcv / 1024);
                     }
                     ctx->last_buf_check = now;
                 }
-            } else if (ctx->data_sent_epoch > 0) {
-                ctx->tb.fill_rate += SEND_RATE_LINEAR_INC;
-                if (ctx->tb.fill_rate > SEND_RATE_MAX_BPS)
-                    ctx->tb.fill_rate = SEND_RATE_MAX_BPS;
             }
-            ctx->tb.capacity = ctx->tb.fill_rate * 200 / 1000;
-            if (ctx->tb.tokens > ctx->tb.capacity)
-                ctx->tb.tokens = ctx->tb.capacity;
             ctx->eagain_count = 0;
             ctx->data_sent_epoch = 0;
 
@@ -1518,14 +1505,6 @@ void client_send_p2p_data(struct client_context *ctx, struct peer_session *peer,
 
     uint32_t total = sizeof(struct msg_header) + sizeof(struct p2p_data_header) + len;
     if (total > MAX_MSG_SIZE) return;
-
-    /* Token bucket rate limiting */
-    token_bucket_refill(&ctx->tb);
-    if (!token_bucket_try_consume(&ctx->tb, total)) {
-        int64_t wait = token_bucket_wait_ms(&ctx->tb, total);
-        (void)wait; /* will be used with xpoll timeout */
-        return;
-    }
 
     struct p2p_data_header hdr;
     hdr.session_id = htonl(peer->session_id);

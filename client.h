@@ -27,13 +27,6 @@
 #define UDP_BUF_CHECK_INTERVAL  5
 #define UDP_BUF_GROW_FACTOR     2
 
-#define SEND_RATE_INITIAL_BPS   (50ULL * 1024 * 1024)
-#define SEND_RATE_MIN_BPS       (1ULL * 1024 * 1024)
-#define SEND_RATE_MAX_BPS       (500ULL * 1024 * 1024)
-#define SEND_RATE_LINEAR_INC    (1ULL * 1024 * 1024)
-#define RTT_ESTIMATE_MS         200
-
-#include "token_bucket.h"
 #include "zcpool.h"
 
 #define SEND_QUEUE_SIZE 64
@@ -82,9 +75,6 @@ struct client_context {
     int eagain_count;
     time_t last_buf_check;
     int64_t data_sent_epoch;
-
-    /* Token bucket rate limiting */
-    struct token_bucket tb;
 
     /* Zero-copy buffer pool */
     struct zcpool zp;
