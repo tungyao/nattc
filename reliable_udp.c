@@ -476,8 +476,8 @@ static int process_data_frame(struct reliable_conn *conn,
   conn->pending_ack = 1;
   conn->packets_since_last_ack++;
 
-  /* Send ACK immediately every 2 packets for high throughput */
-  if (conn->packets_since_last_ack >= 2) {
+  /* Send ACK periodically based on ACK_FREQUENCY_THRESHOLD */
+  if (conn->packets_since_last_ack >= ACK_FREQUENCY_THRESHOLD) {
     send_ack_frame(conn, now_ms);
   }
 
