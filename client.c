@@ -893,9 +893,6 @@ void client_run(struct client_context *ctx) {
                 peer = peer->next;
             }
 
-            /* Drain send ring (retry EAGAIN-failed packets) */
-            send_ring_drain(ctx);
-
             /* UDP buffer auto-grow on EAGAIN */
             if (ctx->eagain_count > 0) {
                 if (now - ctx->last_buf_check >= UDP_BUF_CHECK_INTERVAL) {
@@ -938,6 +935,9 @@ void client_run(struct client_context *ctx) {
             }
             last_timeout_check = now;
         }
+
+        /* Drain send ring (retry EAGAIN-failed packets) */
+        send_ring_drain(ctx);
     }
     xpoll_close(xp);
     ctx->xp = NULL;
@@ -1440,6 +1440,7 @@ void client_send_p2p_data(struct client_context *ctx, struct peer_session *peer,
             ctx->eagain_count++;
             peer->tx_seq--;
             send_ring_enqueue(ctx, buf, total, &peer->public_addr);
+            send_ring_drain(ctx);
             return;
         }
         fprintf(stderr, "sendto P2P failed: %s\n", sock_strerror());
