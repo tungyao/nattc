@@ -20,7 +20,7 @@
 #define RELIABLE_STREAM_RECV_BUF_SIZE (1024 * 1024)
 
 /* Maximum number of in-flight (sent but un-acked) packets */
-#define MAX_INFLIGHT 4096
+#define MAX_INFLIGHT 8192
 
 /* Maximum number of streams per connection */
 #define MAX_STREAMS 64
@@ -30,11 +30,12 @@
 #define PACKET_HISTORY_SIZE (PACKET_HISTORY_BITS / 8)
 
 /* Maximum number of ACK ranges we can generate */
-#define MAX_ACK_RANGES 16
+#define MAX_ACK_RANGES 32
 
 /* Default timing constants */
 #define DEFAULT_MAX_ACK_DELAY_MS 5
 #define PING_INTERVAL_MS 1000
+#define ACK_FREQUENCY_THRESHOLD 8
 
 /* Stream states */
 enum stream_state {
@@ -199,6 +200,11 @@ struct reliable_conn {
   uint32_t fec_total_counter;
   struct fec_send_group fec_send;
   struct fec_recv_group fec_recv;
+
+  /* FEC loss tracking for auto-disable */
+  uint32_t fec_loss_window_start;
+  uint32_t fec_loss_count;
+  uint32_t fec_total_count;
 
   /* Linked list of connections (if needed) */
   struct reliable_conn *next;
