@@ -140,6 +140,11 @@ int client_init(struct client_context *ctx, const char *server_ip, uint16_t serv
     ctx->eagain_count = 0;
     ctx->last_buf_check = 0;
     ctx->data_sent_epoch = 0;
+    ctx->tx_packets = 0;
+    ctx->rx_packets = 0;
+    ctx->tx_eagain = 0;
+    ctx->tx_ring_drop = 0;
+    ctx->rx_tun_fail = 0;
     zcpool_init(&ctx->zp);
 
     memset(ctx->send_queue, 0, sizeof(ctx->send_queue));
@@ -436,6 +441,7 @@ int tun_write(struct client_context *ctx, const void *data, uint32_t len) {
         } else {
             perror("write TUN");
         }
+        ctx->rx_tun_fail++;
         return -1;
     }
     return (int)written;
@@ -639,6 +645,7 @@ int send_ring_enqueue(struct client_context *ctx, const char *data, uint32_t len
         if (old->buf) zcpool_free(&ctx->zp, old->buf);
         ctx->send_queue_head = (ctx->send_queue_head + 1) % SEND_QUEUE_SIZE;
         ctx->send_queue_count--;
+        ctx->tx_ring_drop++;
     }
     struct zcpool_buf *buf = zcpool_alloc(&ctx->zp);
     if (!buf) return -1;
@@ -915,6 +922,13 @@ void client_run(struct client_context *ctx) {
             /* Print periodic peer status summary every 5 seconds */
             if (ctx->peers && (now % 5) == 1) {
                 printf("\n========== Peer Status Summary ==========\n");
+                printf("  TX packets=%lu RX packets=%lu\n",
+                       (unsigned long)ctx->tx_packets,
+                       (unsigned long)ctx->rx_packets);
+                printf("  TX EAGAIN=%lu RingDrop=%lu TUNfail=%lu\n",
+                       (unsigned long)ctx->tx_eagain,
+                       (unsigned long)ctx->tx_ring_drop,
+                       (unsigned long)ctx->rx_tun_fail);
                 struct peer_session *p = ctx->peers;
                 while (p) {
                     const char *state_str;
@@ -1289,6 +1303,7 @@ void client_handle_p2p_data(struct client_context *ctx, const struct sockaddr_in
     }
 
     tun_write(ctx, data, data_len);
+    ctx->rx_packets++;
 }
 
 void client_handle_heartbeat_resp(struct client_context *ctx, const struct heartbeat_resp *resp) {
@@ -1439,6 +1454,7 @@ void client_send_p2p_data(struct client_context *ctx, struct peer_session *peer,
            ) {
             ctx->eagain_count++;
             peer->tx_seq--;
+            ctx->tx_eagain++;
             send_ring_enqueue(ctx, buf, total, &peer->public_addr);
             send_ring_drain(ctx);
             return;
@@ -1449,6 +1465,7 @@ void client_send_p2p_data(struct client_context *ctx, struct peer_session *peer,
     }
 
     ctx->data_sent_epoch += total;
+    ctx->tx_packets++;
     peer->last_tx_time = time(NULL);
 }
 

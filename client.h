@@ -76,6 +76,13 @@ struct client_context {
     time_t last_buf_check;
     int64_t data_sent_epoch;
 
+    /* Debug counters */
+    uint64_t tx_packets;
+    uint64_t rx_packets;
+    uint64_t tx_eagain;
+    uint64_t tx_ring_drop;
+    uint64_t rx_tun_fail;
+
     /* Zero-copy buffer pool */
     struct zcpool zp;
 
