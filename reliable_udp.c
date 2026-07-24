@@ -1235,6 +1235,9 @@ struct reliable_conn* reliable_conn_create(uint32_t session_id,
   conn->fec_m = FEC_DEFAULT_M;
   conn->fec_loss_counter = 0;
   conn->fec_total_counter = 0;
+  conn->fec_loss_window_start = 0;
+  conn->fec_loss_count = 0;
+  conn->fec_total_count = 0;
   memset(&conn->fec_send, 0, sizeof(conn->fec_send));
   memset(&conn->fec_recv, 0, sizeof(conn->fec_recv));
 
@@ -1454,6 +1457,7 @@ int reliable_conn_tick(struct reliable_conn *conn, uint32_t now_ms)
     conn->packets_lost++;
     conn->packets_retransmitted++;
     conn->fec_loss_counter++;
+    conn->fec_loss_count++;
 
     uint32_t new_seq = conn->next_packet_seq++;
     uint8_t frame[MAX_DATAGRAM_SIZE];
@@ -1756,6 +1760,20 @@ int reliable_conn_input(struct reliable_conn *conn,
       default:
         break;
     }
+  }
+
+  /* FEC auto-disable: track loss rate over 5-second windows */
+  conn->fec_total_count++;
+  if (conn->fec_enabled && now_ms - conn->fec_loss_window_start > 5000) {
+    if (conn->fec_total_count > 0) {
+      float loss_rate = (float)conn->fec_loss_count / conn->fec_total_count;
+      if (loss_rate < 0.001f) {
+        conn->fec_enabled = 0;
+      }
+    }
+    conn->fec_loss_window_start = now_ms;
+    conn->fec_loss_count = 0;
+    conn->fec_total_count = 0;
   }
 
   return 0;
