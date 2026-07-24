@@ -20,7 +20,7 @@
 #define RELIABLE_STREAM_RECV_BUF_SIZE (1024 * 1024)
 
 /* Maximum number of in-flight (sent but un-acked) packets */
-#define MAX_INFLIGHT 65535
+#define MAX_INFLIGHT 4096
 
 /* Maximum number of streams per connection */
 #define MAX_STREAMS 64

@@ -754,7 +754,7 @@ void client_run(struct client_context *ctx) {
 #ifndef _WIN32
         {
             struct xpoll_event events[2];
-            int n = xpoll_wait(xp, events, 2, 10);
+            int n = xpoll_wait(xp, events, 2, 1);
             if (n < 0) {
                 if (sock_errno() == EINTR) continue;
                 fprintf(stderr, "xpoll_wait failed: %s\n", sock_strerror());
@@ -770,7 +770,7 @@ void client_run(struct client_context *ctx) {
 #else
         {
             struct xpoll_event events[1];
-            int n = xpoll_wait(xp, events, 1, 10);
+            int n = xpoll_wait(xp, events, 1, 1);
             if (n < 0) {
                 int se = sock_errno();
                 if (se == WSAEINTR) continue;
@@ -837,7 +837,7 @@ void client_run(struct client_context *ctx) {
                              rp->last_rx_time = time(NULL);
                             struct reliable_stream *s = rp->rconn->streams;
                             while (s) {
-                                uint8_t rbuf[RELIABLE_STREAM_RECV_BUF_SIZE];
+                                uint8_t rbuf[1300];
                                 int r = reliable_stream_recv(s, rbuf, sizeof(rbuf));
                                 while (r > 0) {
                                     tun_write(ctx, rbuf, (uint32_t)r);
@@ -1510,8 +1510,6 @@ void client_send_p2p_data(struct client_context *ctx, struct peer_session *peer,
         }
         if (s) {
             reliable_stream_send(s, data, len);
-            uint32_t now_ms = reliable_time_ms();
-            reliable_conn_tick(peer->rconn, now_ms);
             return;
         }
     }
