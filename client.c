@@ -1510,6 +1510,8 @@ void client_send_p2p_data(struct client_context *ctx, struct peer_session *peer,
         }
         if (s) {
             reliable_stream_send(s, data, len);
+            uint32_t now_ms = reliable_time_ms();
+            reliable_conn_tick(peer->rconn, now_ms);
             return;
         }
     }
