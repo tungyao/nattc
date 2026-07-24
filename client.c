@@ -837,7 +837,7 @@ void client_run(struct client_context *ctx) {
                              rp->last_rx_time = time(NULL);
                             struct reliable_stream *s = rp->rconn->streams;
                             while (s) {
-                                uint8_t rbuf[1300];
+                                uint8_t rbuf[16384];
                                 int r = reliable_stream_recv(s, rbuf, sizeof(rbuf));
                                 while (r > 0) {
                                     tun_write(ctx, rbuf, (uint32_t)r);
