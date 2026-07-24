@@ -7,15 +7,11 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 # Common sources
 set(COMMON_SOURCES utils.c xpoll.c iocp.c zcpool.c)
 
-# Reliable UDP sources
-set(RELIABLE_SOURCES reliable_udp.c frame.c fec.c congestion.c)
-
 # Server
 add_executable(p2p_server
     main_server.c
     server.c
     ${COMMON_SOURCES}
-    ${RELIABLE_SOURCES}
 )
 target_link_libraries(p2p_server PRIVATE)
 
@@ -24,7 +20,6 @@ add_executable(p2p_client
     main_client.c
     client.c
     ${COMMON_SOURCES}
-    ${RELIABLE_SOURCES}
 )
 target_link_libraries(p2p_client PRIVATE)
 

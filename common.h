@@ -183,8 +183,6 @@ struct arp_entry {
     struct arp_entry *next;
 };
 
-struct reliable_conn;
-
 /* Peer session */
 struct peer_session {
     char id[32];
@@ -205,7 +203,6 @@ struct peer_session {
     int reset_ack_received;
     int reset_retries;
     time_t last_reset_time;
-    struct reliable_conn *rconn;
     struct peer_session *next;
 };
 
