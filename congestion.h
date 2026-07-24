@@ -7,9 +7,9 @@
 #define CUBIC_MSS 1200
 
 /* Congestion window bounds (in bytes) */
-#define CWND_INITIAL (40 * CUBIC_MSS)   /* 48000 */
-#define CWND_MIN     (10 * CUBIC_MSS)   /* 12000 */
-#define SSTHRESH_INITIAL (220 * CUBIC_MSS) /* 264000 */
+#define CWND_INITIAL (100 * CUBIC_MSS)   /* 120000 */
+#define CWND_MIN     (20 * CUBIC_MSS)    /* 24000 */
+#define SSTHRESH_INITIAL (500 * CUBIC_MSS) /* 600000 */
 
 /* RTT constants */
 #define INITIAL_RTT_MS 10

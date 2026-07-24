@@ -16,8 +16,8 @@
 #include "congestion.h"
 
 /* Default buffer sizes */
-#define RELIABLE_STREAM_SEND_BUF_SIZE (64 * 1024)
-#define RELIABLE_STREAM_RECV_BUF_SIZE (64 * 1024)
+#define RELIABLE_STREAM_SEND_BUF_SIZE (1024 * 1024)
+#define RELIABLE_STREAM_RECV_BUF_SIZE (1024 * 1024)
 
 /* Maximum number of in-flight (sent but un-acked) packets */
 #define MAX_INFLIGHT 65535
@@ -33,7 +33,7 @@
 #define MAX_ACK_RANGES 16
 
 /* Default timing constants */
-#define DEFAULT_MAX_ACK_DELAY_MS 25
+#define DEFAULT_MAX_ACK_DELAY_MS 5
 #define PING_INTERVAL_MS 1000
 
 /* Stream states */
@@ -184,7 +184,9 @@ struct reliable_conn {
 
   /* Time-based ACK generation */
   uint32_t last_ack_send_ms;
+  uint32_t last_acked_max_seq;
   int pending_ack;
+  uint32_t packets_since_last_ack;
 
   /* Conn tick state */
   uint32_t last_tick_ms;

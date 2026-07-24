@@ -418,7 +418,9 @@ static int send_ack_frame(struct reliable_conn *conn, uint32_t now_ms)
       ret = fb_send(&fb, conn);
   }
   conn->pending_ack = 0;
+  conn->last_acked_max_seq = conn->ack_tx.max_seq;
   conn->last_ack_send_ms = now_ms;
+  conn->packets_since_last_ack = 0;
   return ret;
 }
 
@@ -452,6 +454,12 @@ static int process_data_frame(struct reliable_conn *conn,
 
   /* Set pending ACK flag (will be sent in tick or coalesced) */
   conn->pending_ack = 1;
+  conn->packets_since_last_ack++;
+
+  /* Send ACK immediately every 2 packets for high throughput */
+  if (conn->packets_since_last_ack >= 2) {
+    send_ack_frame(conn, now_ms);
+  }
 
   /* Check for duplicate or out-of-order */
   if (data->stream_seq < stream->next_stream_seq_recv) {
@@ -963,10 +971,7 @@ static int send_stream_data(struct reliable_conn *conn,
   uint32_t avail = stream->send_buf_head - stream->send_buf_tail;
   if (avail == 0) return 0;
 
-  int sent_this_call = 0;
-
   while (avail > 0) {
-    if (sent_this_call > 0) break;
     /* Check stream-level flow control (absolute byte offset) */
     if (stream->reliable &&
         stream->total_bytes_sent >= stream->flow.send_window) {
@@ -993,7 +998,6 @@ static int send_stream_data(struct reliable_conn *conn,
 
     /* Don't exceed remaining window (absolute offset limit) */
     if (stream->reliable) {
-      if (stream->total_bytes_sent >= stream->flow.send_window) break;
       uint32_t stream_rem = stream->flow.send_window - stream->total_bytes_sent;
       if (chunk_len > stream_rem) chunk_len = stream_rem;
     }
@@ -1067,7 +1071,6 @@ static int send_stream_data(struct reliable_conn *conn,
     if (fb_add(fb, frame, frame_len) != 0) {
       /* Datagram full; send what we have, start new builder */
       if (fb_send(fb, conn) < 0) return -1;
-      sent_this_call++;
       fb_init(fb);
       if (fb_add(fb, frame, frame_len) != 0) return -1;
     }
@@ -1077,9 +1080,7 @@ static int send_stream_data(struct reliable_conn *conn,
       const uint8_t *pload = frame + FRAME_HEADER_SIZE + body_off;
       if (fec_track_sent_packet(conn, packet_seq, stream->stream_id,
                                  fd.stream_seq, pload, (uint16_t)chunk_len)) {
-        int before_count = sent_this_call;
         if (fec_send_parity(conn, fb, now_ms) != 0) return -1;
-        sent_this_call++;
       }
       conn->fec_total_counter++;
       fec_adaptive_update(conn);
@@ -1187,7 +1188,9 @@ struct reliable_conn* reliable_conn_create(uint32_t session_id,
   conn->conn_send_window = MAX_STREAMS * RELIABLE_STREAM_SEND_BUF_SIZE;
   conn->pending_ack = 0;
   conn->last_ack_send_ms = 0;
+  conn->last_acked_max_seq = 0;
   conn->last_tick_ms = 0;
+  conn->packets_since_last_ack = 0;
 
   conn->inflight = (struct inflight_entry*)calloc(MAX_INFLIGHT, sizeof(struct inflight_entry));
   if (!conn->inflight) {
@@ -1539,12 +1542,14 @@ int reliable_conn_tick(struct reliable_conn *conn, uint32_t now_ms)
       }
     }
     conn->pending_ack = 0;
+    conn->last_acked_max_seq = conn->ack_tx.max_seq;
     conn->last_ack_send_ms = now_ms;
   }
 
-  /* 4. Timer-based ACK generation (every 10ms if no data flowing) */
+  /* 4. Timer-based ACK generation (every 1ms if no data flowing) */
   if (!conn->pending_ack && conn->last_ack_send_ms > 0 &&
-      now_ms - conn->last_ack_send_ms >= 10) {
+      now_ms - conn->last_ack_send_ms >= 1 &&
+      conn->ack_tx.max_seq > conn->last_acked_max_seq) {
     uint8_t ack_buf[MAX_DATAGRAM_SIZE];
     build_header(ack_buf, FRAME_TYPE_ACK, CONNECTION_STREAM_ID, 0);
 
