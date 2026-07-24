@@ -197,8 +197,28 @@ static void ack_tracker_received(struct ack_tracker *at, uint32_t seq,
                                   uint32_t now_ms)
 {
   if (seq >= at->base_seq + PACKET_HISTORY_BITS) {
-    memset(at->bitmap, 0, PACKET_HISTORY_SIZE);
-    at->base_seq = seq;
+    uint32_t shift = seq - at->base_seq - PACKET_HISTORY_BITS + 1;
+    if (shift >= PACKET_HISTORY_BITS) {
+      memset(at->bitmap, 0, PACKET_HISTORY_SIZE);
+      at->base_seq = seq;
+    } else {
+      uint32_t byte_shift = shift / 8;
+      uint32_t bit_shift = shift % 8;
+      
+      if (byte_shift > 0) {
+        memmove(at->bitmap, at->bitmap + byte_shift,
+                PACKET_HISTORY_SIZE - byte_shift);
+        memset(at->bitmap + PACKET_HISTORY_SIZE - byte_shift, 0, byte_shift);
+      }
+      if (bit_shift > 0) {
+        for (uint32_t i = 0; i < PACKET_HISTORY_SIZE - 1; i++) {
+          at->bitmap[i] = (at->bitmap[i] >> bit_shift) |
+                          (at->bitmap[i + 1] << (8 - bit_shift));
+        }
+        at->bitmap[PACKET_HISTORY_SIZE - 1] >>= bit_shift;
+      }
+      at->base_seq += shift;
+    }
   }
 
   if (seq < at->base_seq)
@@ -588,7 +608,6 @@ static void process_ack_frame(struct reliable_conn *conn,
     uint32_t lost_seq = ack->largest_acked - ack->first_ack_range;
     struct inflight_entry *e = inflight_lookup(conn, lost_seq);
     if (e && !e->acked && e->reliable) {
-      uint32_t new_seq = conn->next_packet_seq++;
       uint8_t frame[MAX_DATAGRAM_SIZE];
       uint8_t retrans_prio = 0;
       struct reliable_stream *retrans_s = find_stream(conn, e->stream_id);
@@ -596,7 +615,7 @@ static void process_ack_frame(struct reliable_conn *conn,
       build_header(frame, FRAME_TYPE_DATA, e->stream_id, retrans_prio);
 
       struct frame_data fd;
-      fd.packet_seq = new_seq;
+      fd.packet_seq = e->packet_seq;
       fd.stream_seq = e->stream_seq;
       fd.data_len = e->payload_len;
       int body_off = frame_serialize_data_body(frame + FRAME_HEADER_SIZE, &fd);
@@ -604,7 +623,6 @@ static void process_ack_frame(struct reliable_conn *conn,
 
       uint16_t frame_len = FRAME_HEADER_SIZE + body_off + e->payload_len;
 
-      e->packet_seq = new_seq;
       e->send_time_ms = now_ms;
       e->acked = 0;
       e->dup_ack_count = 0;
@@ -972,17 +990,6 @@ static int send_stream_data(struct reliable_conn *conn,
   if (avail == 0) return 0;
 
   while (avail > 0) {
-    /* Check stream-level flow control (absolute byte offset) */
-    if (stream->reliable &&
-        stream->total_bytes_sent >= stream->flow.send_window) {
-      break;
-    }
-
-    /* Check connection-level flow control */
-    if (conn->conn_bytes_in_flight >= conn->conn_send_window) {
-      break;
-    }
-
     uint32_t chunk_len = avail < MAX_FRAME_BODY ? avail : MAX_FRAME_BODY;
 
     /* Congestion control: don't exceed cwnd */
@@ -995,14 +1002,6 @@ static int send_stream_data(struct reliable_conn *conn,
         break;
       }
     }
-
-    /* Don't exceed remaining window (absolute offset limit) */
-    if (stream->reliable) {
-      uint32_t stream_rem = stream->flow.send_window - stream->total_bytes_sent;
-      if (chunk_len > stream_rem) chunk_len = stream_rem;
-    }
-    uint32_t conn_rem = conn->conn_send_window - conn->conn_bytes_in_flight;
-    if (chunk_len > conn_rem) chunk_len = conn_rem;
     if (chunk_len == 0) break;
 
     uint32_t packet_seq = conn->next_packet_seq++;
@@ -1376,19 +1375,6 @@ int reliable_stream_recv(struct reliable_stream *stream,
 
   stream->recv_buf_tail += to_copy;
 
-  /* Proactive WINDOW_UPDATE: if recv buffer has opened up significantly */
-  struct reliable_conn *conn = stream->conn;
-  if (conn) {
-    uint32_t recv_used = stream->recv_buf_head - stream->recv_buf_tail;
-    uint32_t recv_free = RELIABLE_STREAM_RECV_BUF_SIZE - recv_used;
-    /* Send update if free space > 50% of buffer */
-    if (recv_free > RELIABLE_STREAM_RECV_BUF_SIZE / WINDOW_UPDATE_FREE_RATIO) {
-      uint32_t max_data = stream->recv_buf_tail + RELIABLE_STREAM_RECV_BUF_SIZE;
-      if (send_window_update_frame(conn, stream->stream_id, max_data) < 0)
-        stream->pending_window_update = 1;
-    }
-  }
-
   return (int)to_copy;
 }
 
@@ -1401,41 +1387,53 @@ int reliable_conn_tick(struct reliable_conn *conn, uint32_t now_ms)
 
   conn->last_tick_ms = now_ms;
 
-  /* 0. Retry any pending WINDOW_UPDATE frames */
-  {
-    struct reliable_stream *wu_s = conn->streams;
-    while (wu_s) {
-      if (wu_s->pending_window_update) {
-        uint32_t max_data = wu_s->recv_buf_tail + RELIABLE_STREAM_RECV_BUF_SIZE;
-        if (send_window_update_frame(conn, wu_s->stream_id, max_data) == 0)
-          wu_s->pending_window_update = 0;
-      }
-      wu_s = wu_s->next;
-    }
-  }
-
-  /* 1. Check for retransmission timeouts */
+  /* 1. Check for retransmission timeouts (max 4 retransmits per tick to avoid bursts) */
   uint32_t timeout_ms = rtt_compute_timeout_ms(&conn->rtt,
                                                  conn->max_ack_delay_ms);
   int had_timeout = 0;
+  int retrans_this_tick = 0;
   for (int i = 0; i < MAX_INFLIGHT; i++) {
     struct inflight_entry *e = &conn->inflight[i];
     if (!e->valid || e->acked || !e->reliable) continue;
     if (now_ms - e->send_time_ms <= timeout_ms) continue;
 
-    /* Timeout - retransmit */
+    /* Give up: receiver's ack_tracker window has slid past this seq */
+    if (conn->last_acked_seq > 0 &&
+        e->packet_seq + PACKET_HISTORY_BITS < conn->last_acked_seq) {
+      if (conn->conn_bytes_in_flight >= e->payload_len)
+        conn->conn_bytes_in_flight -= e->payload_len;
+      struct reliable_stream *gs = find_stream(conn, e->stream_id);
+      if (gs && gs->flow.bytes_in_flight >= e->payload_len)
+        gs->flow.bytes_in_flight -= e->payload_len;
+      e->valid = 0;
+      continue;
+    }
+
+    /* Give up: too many retransmit attempts */
+    if (e->retransmits >= 10) {
+      if (conn->conn_bytes_in_flight >= e->payload_len)
+        conn->conn_bytes_in_flight -= e->payload_len;
+      struct reliable_stream *gs = find_stream(conn, e->stream_id);
+      if (gs && gs->flow.bytes_in_flight >= e->payload_len)
+        gs->flow.bytes_in_flight -= e->payload_len;
+      e->valid = 0;
+      continue;
+    }
+
+    /* Timeout - retransmit (limit burst to 4 packets per tick) */
+    if (retrans_this_tick >= 4) break;
     if (!had_timeout) {
       reno_on_loss(&conn->congestion, now_ms, 1);
       conn->recovery_end_seq = conn->next_packet_seq;
       conn->dup_ack_count = 0;
       had_timeout = 1;
     }
+    retrans_this_tick++;
     e->retransmits++;
     conn->packets_lost++;
     conn->packets_retransmitted++;
     conn->fec_loss_counter++;
 
-    uint32_t new_seq = conn->next_packet_seq++;
     uint8_t frame[MAX_DATAGRAM_SIZE];
     uint8_t retrans_prio = 0;
     struct reliable_stream *retrans_s = find_stream(conn, e->stream_id);
@@ -1443,7 +1441,7 @@ int reliable_conn_tick(struct reliable_conn *conn, uint32_t now_ms)
     build_header(frame, FRAME_TYPE_DATA, e->stream_id, retrans_prio);
 
     struct frame_data fd;
-    fd.packet_seq = new_seq;
+    fd.packet_seq = e->packet_seq;
     fd.stream_seq = e->stream_seq;
     fd.data_len = e->payload_len;
     int body_off = frame_serialize_data_body(frame + FRAME_HEADER_SIZE, &fd);
@@ -1451,27 +1449,9 @@ int reliable_conn_tick(struct reliable_conn *conn, uint32_t now_ms)
 
     uint16_t frame_len = FRAME_HEADER_SIZE + body_off + e->payload_len;
 
-    /* Move inflight entry to correct slot for new sequence number */
-    uint32_t new_idx = new_seq % MAX_INFLIGHT;
-    struct inflight_entry *new_slot = &conn->inflight[new_idx];
-    if ((uint32_t)i != new_idx) {
-      if (new_slot->valid && !new_slot->acked) {
-        conn->next_packet_seq--;
-        continue;
-      }
-      inflight_free_payload(new_slot);
-      *new_slot = *e;
-      memset(e, 0, sizeof(*e));
-      new_slot->packet_seq = new_seq;
-      new_slot->send_time_ms = now_ms;
-      new_slot->acked = 0;
-      new_slot->dup_ack_count = 0;
-    } else {
-      e->packet_seq = new_seq;
-      e->send_time_ms = now_ms;
-      e->acked = 0;
-      e->dup_ack_count = 0;
-    }
+    e->send_time_ms = now_ms;
+    e->acked = 0;
+    e->dup_ack_count = 0;
 
     if (fb_add(&fb, frame, frame_len) != 0) {
       if (fb_send(&fb, conn) < 0) return -1;
@@ -1717,19 +1697,6 @@ int reliable_conn_input(struct reliable_conn *conn,
       }
 
       case FRAME_TYPE_WINDOW_UPDATE: {
-        const uint8_t *body = frame + FRAME_HEADER_SIZE;
-        uint16_t body_len = frame_len - FRAME_HEADER_SIZE;
-        if (body_len < 4) return -1;
-        struct frame_window_update wu;
-        if (frame_deserialize_window_update_body(&wu, body) != 4)
-          return -1;
-        if (hdr.stream_id == CONNECTION_STREAM_ID) {
-          conn->conn_send_window = wu.max_data;
-        } else {
-          struct reliable_stream *s = find_stream(conn, hdr.stream_id);
-          if (s)
-            s->flow.send_window = wu.max_data;
-        }
         break;
       }
 
